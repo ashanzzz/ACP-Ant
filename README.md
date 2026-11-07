@@ -1,0 +1,267 @@
+# ACP-Ant
+
+把 Google 官方 **Antigravity CLI（`agy`）** 通过 **ACP 协议（Agent Client Protocol）** 变成标准的大模型接口：
+**OpenAI Chat Completions、OpenAI Responses、Anthropic Messages** 三种格式都支持，带**工具调用（function calling）**，Agent 和应用可以直接接入。
+支持**多个 Google 账号轮流使用，每个账号走自己的代理节点**。
+
+- 用的是 Google 官方命令行程序和官方协议，不抓包、不反代网页登录凭据。
+- Codex CLI、OpenAI SDK、LangChain、Dify、Cline、OpenCode……只要支持 OpenAI 或 Anthropic 接口，填上地址、密钥和模型名就能用。
+- 账号多了自动分流；某个账号额度用完、被限速、要求验证时自动换下一个账号。
+
+[English](#english)
+
+---
+
+## 它做了什么
+
+```
+Agent / 应用 ──OpenAI 或 Anthropic 接口──▶ ACP-Ant（127.0.0.1:8095）
+  （工具由 Agent 自己执行）                       │  挑一个空闲账号
+                                                 ├─▶ agy acp（账号 g1，HOME=accounts/g1，走代理 A）──▶ Google Antigravity
+                                                 ├─▶ agy acp（账号 g2，HOME=accounts/g2，走代理 B）──▶ Google Antigravity
+                                                 └─▶ agy acp（账号 g3，HOME=accounts/g3，走代理 C）──▶ Google Antigravity
+```
+
+- **三种接口**：`/v1/chat/completions`（OpenAI）、`/v1/responses`（OpenAI 新接口，Codex 用这个）、`/v1/messages`（Anthropic），都支持流式输出。
+- **工具调用**：Agent 声明的工具（OpenAI `tools`、Anthropic `tools`、Responses 的 function / custom 工具）会写进提示词交给模型。模型要用工具时，网关把它的回复转成标准的 `tool_calls` / `tool_use` / `function_call` 返回给 Agent。Agent 自己执行工具，再把结果发回来。支持一次调用多个工具，也支持 `tool_choice`。
+- **图片**：data URL、http(s) 图片链接（网关代为下载）、工具结果里的图片都可以。
+- **每个账号一个独立目录**：`agy` 的 HOME 指向这个目录，登录凭据只存在这里，账号之间互不串。
+- **每个账号一个独立代理**（可选）：`http://`、`https://`、`socks5://`，可带用户名密码。添加时会测出口 IP 和国家，两个账号用了同一个 IP 会提醒。
+- **Antigravity 自己不碰你的机器**：网关给 `agy` 注册的 agent 没有任何内置工具，权限请求一律拒绝。工具只在 Agent 那边执行。
+- **自动换号**：还没输出正文前出错就换下一个账号重试；额度用完歇 30 分钟、限速歇 90 秒、要求验证歇 10 分钟，登录失效的账号停用。
+- **认得 Antigravity 的「软错误」**：审核拦截、账号需要验证、上游报错（如 `RESOURCE_EXHAUSTED`）时，Antigravity 不会报错，而是把一句固定的话当成回答发回来，有时还会在后台重试好几分钟。网关几秒内就能认出这些情况，返回标准错误码，Agent 能正常重试或换通道。
+- **模型名兜底**：Agent 请求了 Antigravity 没有的模型名（例如写死的 `gpt-4o`），自动改用默认模型（可关闭）。
+- **隐私**：`agy` 每次对话都会在本地存一份记录，网关每小时删掉超过 6 小时的（可配置）。
+- **新加账号不用重启**：网关会自动发现新账号。
+
+## 要求
+
+- Linux（x86_64 或 arm64），Python 3.9+，`curl`；用 systemd 装成服务需要 sudo。
+- 一个或多个能用 Antigravity 的 Google 账号（例如 Google AI Pro）。
+- 可选：每个账号一个代理节点。
+
+## 安装
+
+```bash
+git clone https://github.com/czg86389-hub/ACP-Ant.git
+cd ACP-Ant
+./install.sh
+```
+
+安装脚本会：
+1. 从官方地址（`https://antigravity.google/cli/install.sh`）安装 `agy` 到 `/opt/acp-ant/bin`；
+2. 建 Python 虚拟环境并装依赖（FastAPI、Uvicorn）；
+3. 生成随机网关密钥，写进 `/opt/acp-ant/gateway.env`（权限 600）；
+4. 装成 systemd 服务 `acp-ant`，只监听 `127.0.0.1:8095`。
+
+可以用环境变量改安装位置和端口：`AGY_ROOT=/srv/acp-ant AGY_PORT=9000 ./install.sh`；不想装服务就加 `--no-systemd`。
+
+## 添加账号
+
+每个账号起一个名字（字母、数字、`-`、`_`），例如 `g1`：
+
+```bash
+/opt/acp-ant/account.sh add g1
+```
+
+1. **输入代理地址**（输入时屏幕上不显示，粘贴后直接回车），例如 `socks5://用户名:密码@1.2.3.4:1080`。脚本会测这个代理的出口 IP 和国家。
+2. **登录 Google**：屏幕上会出现一个授权网址。复制到**你自己电脑**的浏览器里打开，选这个账号并同意。浏览器最后会跳到一个打不开的 `localhost` 网址，或者显示一串授权码。把整串网址或授权码复制回终端，粘贴后回车。
+3. 显示「已登录，可用模型：…」就好了。
+
+中途关掉也没关系，再运行一次 `add g1` 会接着做。其它命令：
+
+| 命令 | 作用 |
+|---|---|
+| `account.sh list` | 列出所有账号、代理（只显示主机和端口）、出口 IP、登录状态和可用模型 |
+| `account.sh check g1` | 真发一句话测试；如果 Google 要求验证这个账号，会打印验证网址 |
+| `account.sh login g1` | 重新登录（代理不变） |
+| `account.sh proxy g1` | 换代理节点 |
+| `account.sh remove g1` | 删除账号（含登录凭据，会先确认） |
+
+不想用代理：`AGY_REQUIRE_PROXY=0 /opt/acp-ant/account.sh add g1`，同时在 `gateway.env` 里加一行 `AGY_REQUIRE_PROXY=0`。
+
+## 接入 Agent 和应用
+
+不管用哪个 Agent，都填这三样：
+
+- **地址**：`http://127.0.0.1:8095/v1`（Anthropic 格式的客户端填 `http://127.0.0.1:8095`）
+- **密钥**：`grep AGY_GATEWAY_KEY /opt/acp-ant/gateway.env` 看到的那串
+- **模型名**：推荐 `gemini-3.8-flash-medium`（其它见下面的「模型名」）
+
+**Agent 在你自己电脑上、网关在服务器上**时，最简单安全的办法是 SSH 隧道。在你电脑上运行下面这条命令并保持窗口打开，然后照样填 `http://127.0.0.1:8095/v1`：
+
+```bash
+ssh -N -L 8095:127.0.0.1:8095 用户名@服务器
+```
+
+不要把 8095 端口直接暴露到公网；确实要公网访问，请用 Nginx / Caddy 加 HTTPS 反向代理。
+
+### 测试过的
+
+| Agent | 接口 | 结果 |
+|---|---|---|
+| **Codex CLI** 0.134 | OpenAI Responses | ✅ 真跑通：用 shell 工具建文件、再读回来，15 秒 |
+| OpenAI 格式的工具调用 | Chat Completions | ✅ `scripts/agent_test.py`：工具调用、带工具结果的第二轮、流式工具调用、JSON 模式 |
+| Anthropic 格式的工具调用 | Messages | ✅ 同上：`tool_use`、`tool_result` 第二轮、流式、`count_tokens` |
+| Responses 格式的工具调用 | Responses | ✅ 同上：`function_call`、`function_call_output` 第二轮、流式自定义工具（custom tool） |
+| **Claude Code** | Anthropic Messages | ❌ **不能用**，见下面说明 |
+
+**Codex CLI**（`~/.codex/config.toml`）：
+
+```toml
+model_provider = "acpant"
+model = "gemini-3.8-flash-medium"
+
+[model_providers.acpant]
+name = "ACP-Ant"
+base_url = "http://127.0.0.1:8095/v1"
+env_key = "ACPANT_KEY"
+wire_api = "responses"
+```
+
+然后 `export ACPANT_KEY=你的网关密钥`，再运行 `codex`。新版 Codex 已经不支持 `wire_api = "chat"`，必须用 `responses`。
+
+**关于 Claude Code**：Google 的 Antigravity 服务端会拒绝带有 Claude Code 特征内容的请求。Claude Code 每次请求都会带一行 `x-anthropic-billing-header` 和一句固定的身份介绍，服务端遇到这两样就返回 `RESOURCE_EXHAUSTED (429)`，和账号额度无关。这是 Google 那边有意的限制，ACP-Ant 不做绕过（绕过有封号风险）。网关会在 2–3 秒内把它当成 429 返回，不会卡住。
+
+### 按 OpenAI 兼容接口配置即可（接口已测，软件本身未逐一实测）
+
+| 软件 | 怎么配 |
+|---|---|
+| OpenAI SDK、LangChain（`ChatOpenAI`）、LlamaIndex、AutoGen、CrewAI 等 | `base_url` 填地址，`api_key` 填密钥，`model` 填模型名 |
+| Cline / Roo Code / Kilo Code（VS Code 插件） | API Provider 选「OpenAI Compatible」，填 Base URL、API Key、Model ID |
+| Continue、Cherry Studio、Open WebUI、LobeChat、Dify、n8n | 添加「OpenAI 兼容」模型供应商，填地址、密钥、模型名 |
+| Aider | `aider --openai-api-base http://127.0.0.1:8095/v1 --openai-api-key 你的密钥 --model openai/gemini-3.8-flash-medium` |
+| OpenCode | 在 `opencode.json` 里加一个 `@ai-sdk/openai-compatible` 供应商，`baseURL` 填地址 |
+| Cursor | 需要一个公网 HTTPS 地址（Cursor 是从它自己的服务器发请求的），本机地址和 SSH 隧道都不行 |
+
+Python 例子（带工具）：
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8095/v1", api_key="你的网关密钥")
+r = client.chat.completions.create(
+    model="gemini-3.8-flash-medium",
+    messages=[{"role": "user", "content": "巴黎现在天气怎么样？"}],
+    tools=[{"type": "function", "function": {"name": "get_weather", "description": "查询城市天气",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}],
+)
+print(r.choices[0].message.tool_calls)   # [ChatCompletionMessageToolCall(function=Function(name='get_weather', arguments='{"city": "Paris"}'), ...)]
+```
+
+自己验证：`python3 /opt/acp-ant/agent_test.py`（三种接口的工具调用全测一遍，约 1–2 分钟）。
+
+### 工具调用是怎么实现的
+
+ACP 协议本身只能让 Antigravity 调用它自己那边的工具，不能把工具调用交还给你的 Agent。所以网关把 Agent 的工具清单（名字、说明、参数格式）写进系统提示词，并规定模型用 `<tool_calls>[...]</tool_calls>` 这种格式提出调用。网关把这段内容解析成标准的工具调用返回给 Agent，Agent 发回的工具结果再写回对话里。
+
+- Gemini 3.8 Flash 用这种方式的成功率很高（上面的测试全部通过）。
+- 模型偶尔会不按格式写；这时网关会把原文当作普通回答返回，Agent 一般会重试或继续。
+- 流式输出时，普通文字照常实时输出，工具调用那一段等写完后一次性发出。
+
+## 模型名
+
+| 模型名 | 实际用的模型 | 思考档位 |
+|---|---|---|
+| `gemini-3.8-flash-high` / `-medium` / `-low` | gemini-3.8-flash | 高 / 中 / 低 |
+| `gemini-3.8-flash` | gemini-3.8-flash | 账号默认 |
+| `gemini-4-argon-high` / `gemini-4-argon` | gemini-4-argon | 高 / 账号默认 |
+
+- 不在表里的名字原样传给 Antigravity，结尾的 `-high` / `-medium` / `-low` 会自动当成思考档位。Antigravity 还提供 `claude-sonnet-5-5`、`claude-opus-5-5`、`gpt-oss-120b-medium` 等模型（以 `account.sh list` 显示的为准），也可以直接用。
+- `GET /v1/models` 会列出别名和账号实际提供的模型（网关处理过一次请求后才知道账号有哪些模型）。
+- Agent 请求了不存在的模型名，默认改用 `AGY_DEFAULT_MODEL`（`gemini-3.8-flash-medium`）；`AGY_MODEL_FALLBACK=0` 改为报错。
+- 自定义别名：`AGY_MODEL_ALIASES={"fast": ["gemini-3.8-flash", "low"]}`。
+- OpenAI 的 `reasoning_effort` / Responses 的 `reasoning.effort`（low / medium / high）会当作思考档位（模型名里已经写了档位的以模型名为准）。
+
+**速度提示**：高思考档非常慢，复杂长文一次可能要几分钟，一般用 `medium` 就够了。
+
+ACP 协议没有 `temperature`、`max_tokens` 参数，这两个字段会被忽略。回复被截断时，网关会在同一个会话里让模型接着写，最多 3 次。
+
+## 管理接口（都要带密钥）
+
+| 接口 | 作用 |
+|---|---|
+| `GET /admin/status` | 每个账号的状态：能不能用、正在跑几个、成功 / 失败次数、冷却剩余秒数、最近一次错误 |
+| `GET /admin/status?quota=1` | 再加上每个账号的剩余额度（每周和 5 小时两个窗口；查询本身不消耗额度，缓存 10 分钟） |
+| `POST /admin/reset/{名字}` | 重新登录或换代理后，清掉这个账号的冷却 / 停用标记，并重启它的进程 |
+| `GET /healthz` | 存活检查（不需要密钥，只返回账号数） |
+
+密钥可以放在 `Authorization: Bearer <密钥>`、`x-api-key` 或 `api-key` 请求头里。OpenAI 格式的非流式回复里有 `x_account` 字段，写着这次用的是哪个账号。
+
+## 出错时怎么处理
+
+| 情况 | 网关的做法 | 返回给调用方 |
+|---|---|---|
+| 额度用完 | 这个账号歇 30 分钟（或到额度重置时间），换下一个 | 全部不可用时 429 |
+| 限速 / 过载 | 歇 90 秒，换下一个 | 全部不可用时 429 |
+| 上游 `RESOURCE_EXHAUSTED` 软错误 | 几秒内认出来；再换 1 个账号试；后台查真实额度，真用完了才让账号歇 | 429 |
+| Google 要求验证账号 | 歇 10 分钟，换下一个；用 `account.sh check` 拿验证网址 | 全部不可用时 503 |
+| 登录失效 | 停用这个账号，`account.sh login` 后再 `/admin/reset` | 全部不可用时 503 |
+| 被 Antigravity 审核拦截 | 不换号（换了也一样） | 400 |
+| 模型名不存在（关了兜底时） | 不换号 | 400 |
+| 超时 | 默认 290 秒 | 504 |
+
+Anthropic 格式下，「没有可用账号」返回 529（overloaded），Claude 系客户端会自动重试。冷却时间等所有选项见 [gateway.env.example](gateway.env.example)。
+
+## 安全与隐私
+
+- 网关默认只监听 `127.0.0.1`，所有接口（除了 `/healthz`）都要密钥。
+- Google 登录凭据由官方 `agy` 自己保存在每个账号的目录里，网关不读、不存、不打印。
+- 代理地址（含密码）存在 `accounts/<名字>/proxy.env`，权限 600；`list` 只显示主机和端口。
+- `accounts/`、`gateway.env` 已写进 `.gitignore`，**不要把它们传到任何地方**。
+- 网关启动 `agy` 时加了 `--disable-telemetry`，关闭它的遥测。
+
+## 排查工具
+
+- `python3 /opt/acp-ant/smoke_test.py [图片路径] [并发数]`：冒烟测试（短回复、系统提示词、读图、并发）。
+- `python3 /opt/acp-ant/agent_test.py [模型名]`：Agent 相关测试（三种接口的工具调用、流式、JSON 模式）。
+- `HOME=/opt/acp-ant/accounts/g1 HTTPS_PROXY=<代理地址> python3 /opt/acp-ant/acp_probe.py --prompt "Reply with OK"`：直接和 `agy acp` 握手，打印协议往来（看账号有哪些模型和思考档位）。
+- 日志：`journalctl -u acp-ant -f`；每个账号的 `agy` 日志在 `accounts/<名字>/gw/`。
+
+## 免责声明
+
+- 本项目是个人开源工具，**不是 Google 官方项目**，和 Google 没有任何关系。
+- 使用前请阅读并遵守 Google Antigravity 和你所用订阅的服务条款。把个人订阅的额度提供给多人或商业服务使用，可能违反条款，并导致账号被限制或封禁。风险由使用者自己承担。
+- 本项目不绕过 Google 的任何限制（比如上面说的 Claude Code）。
+- Antigravity CLI 和 ACP 协议都还在变化，新版本可能改变行为。本项目在 `agy` 1.5.2 上测试通过。
+
+## 致谢
+
+用 ACP 协议驱动 `agy acp` 的思路来自 [lili-luo/dsh-plugin-bundle](https://github.com/lili-luo/dsh-plugin-bundle) 里的 `dsh-llm-antigravity-acp`（MIT）。本项目是独立实现，并增加了三种标准接口、工具调用、多账号、每账号代理、自动换号、软错误识别、额度查询和会话清理。
+
+## 许可证
+
+[MIT](LICENSE)
+
+---
+
+<a id="english"></a>
+## English
+
+ACP-Ant turns Google's official **Antigravity CLI (`agy`)** into a standard LLM API by talking to it over the **Agent Client Protocol (ACP)**. It exposes **OpenAI Chat Completions, OpenAI Responses and Anthropic Messages**, with **tool calling**, so agents and apps can plug straight in. It runs **several Google accounts side by side, each through its own proxy**.
+
+- **Three APIs:** `/v1/chat/completions`, `/v1/responses` (used by Codex CLI) and `/v1/messages`, all with streaming.
+- **Tool calling:** OpenAI `tools`, Anthropic `tools`, and Responses function and custom tools are described to the model. Its requests come back as native `tool_calls` / `tool_use` / `function_call` items. Your agent runs the tools; Antigravity itself has no tools and every permission request is refused.
+- **Isolation:** each account has its own HOME directory, so credentials stay separate, and optionally its own HTTP/SOCKS5 proxy.
+- **Load spreading:** requests go to the least busy account, round-robin among equals.
+- **Failover:** quota, rate-limit and "verify your account" errors put that account on cooldown and move to the next one. Expired logins disable the account.
+- **Soft errors:** Antigravity reports prompt-filter refusals, "Verification Required" and upstream API errors as plain text, sometimes after minutes of internal retries. ACP-Ant recognises them within seconds and returns proper error codes.
+- **Unknown model names** fall back to the default model, which can be turned off.
+- **Cleanup:** local conversation files older than 6 hours are deleted every hour.
+
+**Tested:**
+- Codex CLI 0.134 (Responses API) completes a real shell-tool task.
+- `scripts/agent_test.py` passes tool calling on all three APIs: first call, round trip with the result, streaming, JSON mode and custom tools.
+
+**Not supported:** Claude Code. Google's Antigravity backend refuses requests that carry Claude Code's `x-anthropic-billing-header` line or its identity sentence, answering `RESOURCE_EXHAUSTED (429)`. ACP-Ant does not work around this; it returns a 429 within seconds instead of hanging.
+
+```bash
+git clone https://github.com/czg86389-hub/ACP-Ant.git && cd ACP-Ant && ./install.sh
+/opt/acp-ant/account.sh add g1      # enter the proxy (hidden input), then log in with Google
+# Codex: model_provider "acpant", base_url "http://127.0.0.1:8095/v1", wire_api "responses", env_key "ACPANT_KEY"
+```
+
+All settings are listed in [gateway.env.example](gateway.env.example).
+
+**Disclaimer:** this is an unofficial tool, not affiliated with Google. Follow the Antigravity terms of service. Sharing a personal subscription with many users or with a commercial service may break those terms and get accounts restricted. Use at your own risk. Tested with `agy` 1.5.2.
+
+Inspired by `dsh-llm-antigravity-acp` in [lili-luo/dsh-plugin-bundle](https://github.com/lili-luo/dsh-plugin-bundle) (MIT). Licensed under [MIT](LICENSE).

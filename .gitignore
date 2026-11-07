@@ -1,0 +1,12 @@
+# 账号目录（含 Google 登录凭据和代理密码）、网关密钥，永远不要提交
+accounts/
+gateway.env
+*.env
+!gateway.env.example
+proxy.env
+bin/
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.log

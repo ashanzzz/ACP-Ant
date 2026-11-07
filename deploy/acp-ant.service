@@ -1,0 +1,17 @@
+[Unit]
+Description=ACP-Ant: OpenAI-compatible gateway for the official Antigravity CLI (multi-account, per-account proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=@USER@
+WorkingDirectory=@ROOT@
+EnvironmentFile=@ROOT@/gateway.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@ROOT@/venv/bin/uvicorn acp_ant:app --host @HOST@ --port @PORT@ --app-dir @ROOT@ --log-level warning
+Restart=always
+RestartSec=3
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target
