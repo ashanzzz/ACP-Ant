@@ -10,3 +10,9 @@ venv/
 __pycache__/
 *.pyc
 *.log
+
+# 面板和网关运行时生成的文件（含管理员密码哈希、初始密码、调用统计），不要提交
+panel.json
+panel-initial-password.txt
+stats.json
+*.tmp
