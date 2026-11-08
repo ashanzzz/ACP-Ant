@@ -245,6 +245,8 @@ async def restart_acp(acc) -> None:
     acc.cooldown_until, acc.cooldown_kind, acc.disabled_reason = 0.0, "", ""
     if acc.acp:
         await acc.acp.stop()
+        if acc.enabled:
+            asyncio.create_task(acc.acp.prewarm())
 
 
 AUTH_WORDS = re.compile(r"sign in|not logged in|unauthenticated|authentication required|invalid_grant|needs a new login", re.I)

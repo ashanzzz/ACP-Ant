@@ -15,7 +15,7 @@ know how to talk to:
     GET  /healthz                   liveness (no auth, counts only)
 
 How it talks to Antigravity (ACP = Agent Client Protocol, JSON-RPC over stdio):
-    agy acp --gemini-dir <account>/.gemini --agent <name> --process-per-session --disable-telemetry
+    agy acp --gemini-dir <account>/.gemini --agent <name> --disable-telemetry      (one long-lived process per account)
     initialize -> session/new (system prompt via _meta.antigravity.systemPrompt.append)
                -> session/set_config_option (model, thought_level) -> session/prompt (text + image blocks)
                -> session/close
@@ -87,6 +87,10 @@ DEFAULT_MODEL = os.environ.get("AGY_DEFAULT_MODEL", "gemini-3.8-flash-medium")
 MODEL_FALLBACK = _env_bool("AGY_MODEL_FALLBACK", True)         # unknown model name -> DEFAULT_MODEL instead of an error
 MAX_IMAGES = _env_int("AGY_MAX_IMAGES", 10)                    # images per request (the most recent ones are kept)
 FETCH_IMAGES = _env_bool("AGY_FETCH_IMAGES", True)             # download http(s) image URLs sent by clients
+# One long-lived `agy acp` per account serving all its sessions: session/new takes ~0.02 s instead of ~2 s with
+# --process-per-session (which starts a new worker for every request). Set 1 to go back to a process per session.
+PROCESS_PER_SESSION = _env_bool("AGY_PROCESS_PER_SESSION", False)
+RECYCLE_SESSIONS = _env_int("AGY_RECYCLE_SESSIONS", 500)      # restart a shared process when idle after this many sessions
 
 # Public model name -> (Antigravity model id, thought level or None to keep the account default).
 # Names not listed here are passed through; a trailing -high / -medium / -low selects the thought level.
@@ -146,6 +150,17 @@ _BLOCK_TEXT = re.compile(r"^\s*The prompt could not be submitted|Generative AI P
 #   "⚠ API error (attempt 1): RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota)."
 #   ... "⚠ Agent execution terminated due to error."
 _APIERR_TEXT = re.compile(r"^\s*⚠\s*(?:API error \(attempt \d+\):\s*([^\n]+)\n|Agent execution terminated due to error)")
+
+
+# Every canned reply above starts with one of these. As soon as the answer clearly starts with something else it is
+# streamed out right away instead of being held back (first token arrives with the model's first chunk).
+_CANNED_STARTS = ("⚠", "the prompt could not be submitted", "your prompt contains sensitive words", "prompt contains sensitive words",
+                  "verification required", "verify your account")
+
+
+def could_be_canned(text: str) -> bool:
+    t = text.lstrip().lower()
+    return not t or any(t.startswith(p) or p.startswith(t) for p in _CANNED_STARTS)
 
 
 def soft_error(text: str) -> AcpError | None:
@@ -246,7 +261,8 @@ class Turn:
 
 
 class AcpProcess:
-    """One `agy acp` front process per account (--process-per-session: every session gets its own worker)."""
+    """One long-lived `agy acp` process per account; all of the account's sessions run inside it
+    (with AGY_PROCESS_PER_SESSION=1, agy starts a separate worker for every session instead)."""
 
     def __init__(self, account: "Account"):
         self.acc = account
@@ -257,6 +273,7 @@ class AcpProcess:
         self.init_result: dict | None = None
         self.reader_task: asyncio.Task | None = None
         self.lock = asyncio.Lock()
+        self.sessions = 0          # sessions opened since this process started (for recycling)
 
     @property
     def alive(self) -> bool:
@@ -278,8 +295,10 @@ class AcpProcess:
             env.update({"https_proxy": px["HTTPS_PROXY"], "http_proxy": px["HTTP_PROXY"]})
         elif REQUIRE_PROXY:
             raise AcpError(f"account {a.name} has no proxy.env (AGY_REQUIRE_PROXY=1); not starting it", "CONFIG")
-        argv = [AGY, "acp", "--gemini-dir", gem, "--agent", AGENT,
-                "--process-per-session", "--disable-telemetry", "--log-file", os.path.join(a.home, "gw", "acp.log")]
+        argv = [AGY, "acp", "--gemini-dir", gem, "--agent", AGENT, "--disable-telemetry", "--log-file", os.path.join(a.home, "gw", "acp.log")]
+        if PROCESS_PER_SESSION:
+            argv.append("--process-per-session")
+        self.sessions = 0
         self.proc = await asyncio.create_subprocess_exec(*argv, cwd=ws, env=env, stdin=asyncio.subprocess.PIPE,
                                                          stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                                                          limit=64 * 1024 * 1024)
@@ -352,6 +371,27 @@ class AcpProcess:
 
     async def notify(self, method: str, params: dict) -> None:
         await self._send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    async def prewarm(self) -> None:
+        """Start the process and open + close one session so the first real request does not wait for the worker
+        (~2 s). Costs no quota: nothing is sent to the model."""
+        try:
+            await self.ensure()
+            if PROCESS_PER_SESSION:
+                return
+            sess = await self.request("session/new", {"cwd": os.path.join(self.acc.home, "gw", "workspace"), "mcpServers": []}, 120)
+            if sess.get("sessionId"):
+                await self.request("session/close", {"sessionId": sess["sessionId"]}, 15)
+        except Exception as e:  # noqa: BLE001
+            log.info("account %s: prewarm skipped: %s", self.acc.name, str(e)[:160])
+
+    async def maybe_recycle(self) -> None:
+        """Restart a shared process now and then (when idle) so a long-running one never accumulates state."""
+        # only when this finishing request is the account's last one in flight (none still opening a session)
+        if not PROCESS_PER_SESSION and self.sessions >= RECYCLE_SESSIONS and not self.turns and self.acc.inflight <= 1:
+            log.info("account %s: recycling acp process after %d sessions", self.acc.name, self.sessions)
+            await self.stop()
+            asyncio.create_task(self.prewarm())
 
     async def stop(self) -> None:
         if self.alive:
@@ -503,6 +543,7 @@ async def run_on(acc: Account, model: str, effort: str | None, system: str, bloc
     if system:
         params["_meta"] = {"antigravity": {"systemPrompt": {"append": system}}}
     sess = await acp.request("session/new", params, 120)
+    acp.sessions += 1
     sid = sess.get("sessionId")
     if not sid:
         raise AcpError("session/new returned no sessionId", "SERVER")
@@ -548,12 +589,13 @@ async def run_on(acc: Account, model: str, effort: str | None, system: str, bloc
                         held.append(item)
                         held_len += len(item[1])
                         joined = "".join(t for _k, t in held)
-                        err = soft_error(joined) if (held_len >= 400 or joined.lstrip().startswith("⚠")) else None
+                        canned = could_be_canned(joined)
+                        err = soft_error(joined) if (held_len >= 400 or canned) else None
                         if err:
                             await acp.notify("session/cancel", {"sessionId": sid})
                             fut.cancel()
                             raise err
-                        if held_len >= 400:
+                        if held_len >= 400 or not canned:
                             for h in held:
                                 yield h
                             held, released = [], True
@@ -595,6 +637,7 @@ async def run_on(acc: Account, model: str, effort: str | None, system: str, bloc
             await acp.request("session/close", {"sessionId": sid}, 15)
         except Exception:  # noqa: BLE001
             pass
+        await acp.maybe_recycle()
 
 
 async def generate(model_name: str, system: str, blocks: list[dict], effort_override: str | None = None) -> AsyncIterator[tuple[str, str, str]]:
@@ -1699,8 +1742,15 @@ async def _startup() -> None:
     if KEEP_HOURS > 0:
         asyncio.create_task(_janitor())
     asyncio.create_task(_stats_saver())
+    asyncio.create_task(_prewarm_all())
     event("info", "", "gateway started with %d account(s)" % len(POOL.accounts))
     log.info("ACP-Ant ready: %d account(s), agent %s", len(POOL.accounts), AGENT)
+
+
+async def _prewarm_all() -> None:
+    for acc in list(POOL.accounts.values()):
+        if acc.usable() and acc.acp:
+            await acc.acp.prewarm()
 
 
 async def _stats_saver() -> None:
@@ -1721,5 +1771,5 @@ async def _shutdown() -> None:
 try:
     import acp_panel  # noqa: E402
     acp_panel.setup(app, sys.modules[__name__])
-except ImportError:
-    log.warning("acp_panel.py not found next to acp_ant.py: web panel disabled")
+except ImportError as e:   # acp_panel.py missing, or a platform without pty (the gateway itself targets Linux)
+    log.warning("web panel disabled: %s", e)
