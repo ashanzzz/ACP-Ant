@@ -144,7 +144,7 @@ case "$cmd" in
   list)
     for d in "$ACC"/*/; do
       n=$(basename "$d")
-      echo "账号 $n  代理 $(mask "$(proxy_of "$n")")  出口 IP $(cat "$d/egress_ip.txt" 2>/dev/null || echo '?')"
+      echo "账号 $n  代理 $(mask "$(proxy_of "$n")")  出口 IP $(cat "$d/egress_ip.txt" 2>/dev/null || echo '?')$([ -f "$d/disabled" ] && echo '  （已在面板关闭，不会被调用）')"
       status "$n"
     done ;;
   remove)

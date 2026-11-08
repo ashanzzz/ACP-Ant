@@ -7,6 +7,7 @@
 - 用的是 Google 官方命令行程序和官方协议，不抓包、不反代网页登录凭据。
 - Codex CLI、OpenAI SDK、LangChain、Dify、Cline、OpenCode……只要支持 OpenAI 或 Anthropic 接口，填上地址、密钥和模型名就能用。
 - 账号多了自动分流；某个账号额度用完、被限速、要求验证时自动换下一个账号。
+- **网页控制面板**：添加账号、登录 Google、换代理、看每个账号的额度、开关账号、自动巡检，全部在网页里点，不用敲命令。
 
 [English](#english)
 
@@ -56,9 +57,31 @@ cd ACP-Ant
 
 可以用环境变量改安装位置和端口：`AGY_ROOT=/srv/acp-ant AGY_PORT=9000 ./install.sh`；不想装服务就加 `--no-systemd`。
 
-## 添加账号
+## 网页控制面板
 
-每个账号起一个名字（字母、数字、`-`、`_`），例如 `g1`：
+网关的首页就是控制面板：本机打开 `http://127.0.0.1:8095/`，绑定域名后打开 `https://你的域名/`。
+
+- **登录**：管理员密码。第一次的初始密码在服务器的 `/opt/acp-ant/panel-initial-password.txt`（`cat` 一下就能看到），
+  在面板「设置」里改成自己的密码后，这个文件自动删除。也可以在 `gateway.env` 里写 `AGY_PANEL_PASSWORD=` 指定。
+  面板密码和客户端用的 API 密钥是两回事。
+- **账号卡片**：状态（正常 / 已关闭 / 需要 Google 验证 / 冷却中 / 需要重新登录）、代理和出口 IP、
+  **额度**（Gemini 模型、Claude / GPT 模型、Gemini 4 Argon 三组，每组的每周和 5 小时剩余百分比和重置时间）、今天和近 7 天的成功 / 失败次数和 Token 用量、最近错误。
+- **开关**：每个账号右上角一个开关，关掉后这个账号不会再被调用（文件 `accounts/<名字>/disabled`），打开立即恢复。
+- **按钮**：检测（真发一句话；Google 要求验证时直接给出验证链接）、刷新额度、重新登录、换代理、清除冷却、删除。
+- **添加账号向导**：填名字和代理 → 自动测出口 IP（同一 IP 被别的账号用过会提醒）→ 点按钮打开 Google 登录页，
+  把授权码或落地页网址粘贴回面板 → 自动检测，通过后自动开启。登录全程在你自己的浏览器里完成，面板只转交授权码，不保存。
+- **接入信息**：接口地址、一键复制密钥、全部模型名、Codex / PI-Desktop / curl 配置示例。**在线测试**：选模型发一句话。**最近事件**：换号、出错、开关等记录。
+- **自动巡检（保活）**：默认每 6 小时给每个开启的账号读一次额度——**不消耗额度**，顺便刷新 Google 登录令牌、确认代理和登录都正常；
+  发现登录失效会标成「需要重新登录」。可选每天再真发一句话，提前发现「需要 Google 验证」（每天消耗一次极小的额度）。
+
+> 关于保活：Google 的登录令牌由官方 `agy` 在每次使用时自动续期，长期不用一般也不会失效，所以严格意义的保活不是必须的。
+> 巡检的意义在于**提前发现**代理挂了、登录失效这类问题，不用等到真有请求时才知道。
+
+面板接口都在 `/panel/api/` 下：会话 Cookie（HttpOnly、SameSite=Strict），修改类请求要带 `X-ACP-Panel: 1` 请求头，登录失败按 IP 限次。
+
+## 添加账号（命令行方式）
+
+面板里就能添加账号；喜欢命令行的话也可以用脚本。每个账号起一个名字（字母、数字、`-`、`_`），例如 `g1`：
 
 ```bash
 /opt/acp-ant/account.sh add g1
@@ -247,6 +270,13 @@ ACP-Ant turns Google's official **Antigravity CLI (`agy`)** into a standard LLM 
 - **Soft errors:** Antigravity reports prompt-filter refusals, "Verification Required" and upstream API errors as plain text, sometimes after minutes of internal retries. ACP-Ant recognises them within seconds and returns proper error codes.
 - **Unknown model names** fall back to the default model, which can be turned off.
 - **Cleanup:** local conversation files older than 6 hours are deleted every hour.
+- **Web panel** at `/`, protected by an admin password (initial one in `panel-initial-password.txt`). From the panel you can:
+  - add accounts: test the proxy, then log in with Google through a paste box;
+  - re-login, change proxy, health-check, clear cooldowns, delete;
+  - see per-account quota (weekly and 5-hour windows with reset times) and request / token stats;
+  - turn each account on or off;
+  - copy connection info and run a test chat;
+  - enable an automatic patrol that reads quota every few hours (free) and can optionally send one tiny prompt a day.
 
 **Tested:**
 - Codex CLI 0.134 (Responses API) completes a real shell-tool task.

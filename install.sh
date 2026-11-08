@@ -48,7 +48,7 @@ say "Python 虚拟环境和依赖"
 "$ROOT/venv/bin/pip" install -q -r "$SRC/requirements.txt"
 
 say "复制程序文件"
-install -m 644 "$SRC/acp_ant.py" "$ROOT/acp_ant.py"
+install -m 644 "$SRC/acp_ant.py" "$SRC/acp_panel.py" "$SRC/panel.html" "$ROOT/"
 sed -e "s#^ROOT=\${AGY_ROOT:-/opt/acp-ant}#ROOT=\${AGY_ROOT:-$ROOT}#" \
     -e "s#^AGY=\${AGY_BIN:-\$ROOT/bin/agy}#AGY=\${AGY_BIN:-${AGY_BIN:-$ROOT/bin/agy}}#" \
     "$SRC/scripts/account.sh" > "$ROOT/account.sh"
@@ -79,6 +79,8 @@ if [ "$SYSTEMD" = 1 ]; then
   $SUDO systemctl daemon-reload
   $SUDO systemctl enable --now acp-ant
   sleep 2
+  $SUDO systemctl restart acp-ant   # 已经在运行（升级）时也要重启才会用上新代码
+  sleep 3
   systemctl is-active acp-ant >/dev/null && say "服务已启动" || echo "服务没起来，看日志：journalctl -u acp-ant -n 50"
 else
   say "没装服务。手动启动："
@@ -87,7 +89,11 @@ fi
 
 cat <<EOF
 
-安装完成。下一步：添加账号（每个账号一个名字，按提示输入代理并登录 Google）：
+安装完成。
+网页控制面板：http://$HOST:$PORT/   （装在服务器上时，用反向代理绑定域名后用 https://你的域名/ 打开）
+  第一次登录的初始密码保存在 $ROOT/panel-initial-password.txt（查看：cat $ROOT/panel-initial-password.txt），
+  在面板「设置」里改成自己的密码后，这个文件会自动删除。
+在面板里就能添加账号、登录 Google、换代理、看额度、开关账号；也可以用命令行：
   $ROOT/account.sh add g1
 查看账号：  $ROOT/account.sh list
 网关密钥：  grep AGY_GATEWAY_KEY $ROOT/gateway.env

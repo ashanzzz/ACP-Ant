@@ -42,9 +42,11 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 import time
 import urllib.request
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, AsyncIterator
@@ -367,7 +369,9 @@ class Account:
     sem: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(PER_ACCOUNT))
     inflight: int = 0
     cooldown_until: float = 0.0
+    cooldown_kind: str = ""
     disabled_reason: str = ""
+    enabled: bool = True              # switched off in the panel (file <home>/disabled): never picked
     last_error: str = ""
     last_error_at: float = 0.0
     ok: int = 0
@@ -376,10 +380,69 @@ class Account:
     quota: Any = None
     quota_at: float = 0.0
     last_pick: float = 0.0
+    last_check_at: float = 0.0        # last health check (panel button or automatic patrol)
+    last_check_ok: bool | None = None
+    last_check_msg: str = ""
+    verify_url: str = ""              # Google verification link from the last check, if any
     acp: AcpProcess | None = None
 
     def usable(self) -> bool:
-        return not self.disabled_reason and time.time() >= self.cooldown_until
+        return self.enabled and not self.disabled_reason and time.time() >= self.cooldown_until
+
+
+EVENTS: deque = deque(maxlen=400)
+
+
+def event(level: str, account: str, text: str) -> None:
+    """Short in-memory activity log shown in the panel (also goes to the service log)."""
+    EVENTS.append({"t": time.time(), "level": level, "account": account, "text": text[:300]})
+
+
+class Stats:
+    """Requests and tokens per account per day, kept 31 days in $AGY_ROOT/stats.json."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.days: dict[str, dict[str, dict[str, int]]] = {}
+        self.dirty = False
+        try:
+            with open(path) as f:
+                self.days = json.load(f).get("days", {})
+        except (OSError, ValueError):
+            pass
+
+    def record(self, account: str, ok: bool, tokens_in: int = 0, tokens_out: int = 0) -> None:
+        day = time.strftime("%Y-%m-%d")
+        d = self.days.setdefault(day, {}).setdefault(account, {"ok": 0, "fail": 0, "in": 0, "out": 0})
+        d["ok" if ok else "fail"] += 1
+        d["in"] += tokens_in
+        d["out"] += tokens_out
+        self.dirty = True
+
+    def summary(self, account: str, days: int = 1) -> dict[str, int]:
+        keys = sorted(self.days)[-days:]
+        out = {"ok": 0, "fail": 0, "in": 0, "out": 0}
+        for k in keys:
+            for f, v in self.days[k].get(account, {}).items():
+                out[f] = out.get(f, 0) + v
+        return out
+
+    def save(self) -> None:
+        if not self.dirty:
+            return
+        for k in sorted(self.days)[:-31]:
+            del self.days[k]
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump({"days": self.days}, f)
+            os.replace(tmp, self.path)
+            self.dirty = False
+        except OSError as e:
+            log.warning("could not save stats: %s", e)
+
+
+STATS = Stats(os.path.join(ROOT, "stats.json"))
 
 
 class Pool:
@@ -390,20 +453,32 @@ class Pool:
 
     def scan(self) -> None:
         """Every sub-directory of ACCOUNTS_DIR with a proxy.env (or, with AGY_REQUIRE_PROXY=0, a .gemini dir) is an account.
-        New accounts are picked up without a restart."""
+        New accounts are picked up and deleted ones dropped without a restart; <home>/disabled switches one off."""
         if not os.path.isdir(ACCOUNTS_DIR):
             return
+        seen = set()
         for name in sorted(os.listdir(ACCOUNTS_DIR)):
             home = os.path.join(ACCOUNTS_DIR, name)
             if not os.path.isdir(home):
                 continue
             if not (os.path.exists(os.path.join(home, "proxy.env")) or (not REQUIRE_PROXY and os.path.isdir(os.path.join(home, ".gemini")))):
                 continue
+            seen.add(name)
             if name not in self.accounts:
                 acc = Account(name=name, home=home)
                 acc.acp = AcpProcess(acc)
                 self.accounts[name] = acc
                 log.info("account %s added", name)
+                event("info", name, "account added")
+            self.accounts[name].enabled = not os.path.exists(os.path.join(home, "disabled"))
+        for name in [n for n in self.accounts if n not in seen]:
+            acc = self.accounts.pop(name)
+            event("info", name, "account removed")
+            if acc.acp and acc.acp.alive:
+                try:
+                    asyncio.get_running_loop().create_task(acc.acp.stop())
+                except RuntimeError:
+                    pass
 
     def pick(self, exclude: set[str]) -> Account | None:
         self.scan()
@@ -538,6 +613,7 @@ async def generate(model_name: str, system: str, blocks: list[dict], effort_over
             break
         tried.add(acc.name)
         emitted = False
+        tok_in = tok_out = 0
         async with acc.sem:
             acc.inflight += 1
             t0 = time.time()
@@ -545,16 +621,28 @@ async def generate(model_name: str, system: str, blocks: list[dict], effort_over
                 async for kind, text in run_on(acc, model, effort, system, blocks, deadline):
                     if kind == "text" and text:
                         emitted = True
+                    elif kind == "usage":
+                        try:
+                            u = json.loads(text)
+                            tok_in += int(u.get("inputTokens") or 0) + int(u.get("cachedReadTokens") or 0)
+                            tok_out += int(u.get("outputTokens") or 0) + int(u.get("thoughtTokens") or 0)
+                        except (ValueError, TypeError):
+                            pass
                     yield kind, text, acc.name
                 acc.ok += 1
                 acc.last_ok_at = time.time()
+                STATS.record(acc.name, True, tok_in, tok_out)
                 log.info("ok account=%s model=%s %.1fs", acc.name, model_name, time.time() - t0)
                 return
             except AcpError as e:
                 last = e
                 acc.fail += 1
+                STATS.record(acc.name, False)
                 acc.last_error, acc.last_error_at = str(e)[:300], time.time()
                 log.warning("fail account=%s kind=%s %.1fs: %s", acc.name, e.kind, time.time() - t0, str(e)[:300])
+                event("warn", acc.name, "%s: %s" % (e.kind, str(e)[:200]))
+                if e.kind in ("QUOTA", "RATE_LIMIT", "VERIFY"):
+                    acc.cooldown_kind = e.kind
                 if e.kind == "QUOTA":
                     acc.cooldown_until = time.time() + COOLDOWN_QUOTA
                 elif e.kind == "RATE_LIMIT":
@@ -1486,13 +1574,16 @@ async def healthz():
     return {"ok": True, "accounts": len(POOL.accounts), "usable": sum(1 for a in POOL.accounts.values() if a.usable())}
 
 
-async def read_quota(acc: Account) -> Any:
-    """`agy -p /usage --output-format json` (costs no quota), through the account's own proxy; cached 10 minutes."""
-    if acc.quota is not None and time.time() - acc.quota_at < 600:
+async def read_quota(acc: Account, force: bool = False) -> Any:
+    """`agy -p /usage --output-format json` (costs no quota), through the account's own proxy; cached 10 minutes.
+    Returns a list of groups [{group, description, buckets: [{window, name, remaining, reset, description}]}]
+    or {"error": "..."} (login expired, proxy down, ...)."""
+    if not force and acc.quota is not None and time.time() - acc.quota_at < 600:
         return acc.quota
     env = {"HOME": acc.home, "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
     env.update(read_proxy(acc.home))
     os.makedirs(os.path.join(acc.home, "gw", "workspace"), exist_ok=True)
+    out = b""
     try:
         # print mode has no --gemini-dir flag; it uses $HOME/.gemini, which is the login dir
         p = await asyncio.create_subprocess_exec(AGY, "-p", "/usage", "--output-format", "json",
@@ -1501,10 +1592,17 @@ async def read_quota(acc: Account) -> Any:
         out, _ = await asyncio.wait_for(p.communicate(), 60)
         data = json.loads(out.decode() or "{}")
         groups = ((data.get("command") or {}).get("data") or {}).get("groups") or []
-        acc.quota = [{"group": g.get("name"), "buckets": [{"window": b.get("window") or b.get("name"), "remaining": b.get("remaining_fraction"),
-                                                            "reset": b.get("reset_time")} for b in g.get("buckets") or []]} for g in groups]
+        if not groups:
+            raise ValueError(str(data.get("response") or data.get("error") or "no quota data")[:200])
+        acc.quota = [{"group": g.get("name"), "description": g.get("description") or "",
+                      "buckets": [{"window": b.get("window") or b.get("name"), "name": b.get("name") or "",
+                                   "remaining": b.get("remaining_fraction"), "reset": b.get("reset_time"),
+                                   "description": b.get("description") or ""} for b in g.get("buckets") or []]} for g in groups]
+    except asyncio.TimeoutError:
+        acc.quota = {"error": "timed out reading the quota (proxy down?)"}
     except Exception as e:  # noqa: BLE001
-        acc.quota = {"error": str(e)[:200]}
+        text = out.decode(errors="replace").strip() if out else ""
+        acc.quota = {"error": (str(e) if not text or text.startswith("{") else text)[:200]}
     acc.quota_at = time.time()
     return acc.quota
 
@@ -1600,11 +1698,28 @@ async def _startup() -> None:
     POOL.scan()
     if KEEP_HOURS > 0:
         asyncio.create_task(_janitor())
+    asyncio.create_task(_stats_saver())
+    event("info", "", "gateway started with %d account(s)" % len(POOL.accounts))
     log.info("ACP-Ant ready: %d account(s), agent %s", len(POOL.accounts), AGENT)
+
+
+async def _stats_saver() -> None:
+    while True:
+        await asyncio.sleep(60)
+        STATS.save()
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    STATS.save()
     for a in POOL.accounts.values():
         if a.acp:
             await a.acp.stop()
+
+
+# Web control panel (accounts, quota, switches, login, settings): served at "/", API under /panel/api
+try:
+    import acp_panel  # noqa: E402
+    acp_panel.setup(app, sys.modules[__name__])
+except ImportError:
+    log.warning("acp_panel.py not found next to acp_ant.py: web panel disabled")
