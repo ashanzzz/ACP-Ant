@@ -19,7 +19,7 @@ ME=$(basename "$0")
 
 die() { echo "错误：$*" >&2; exit 1; }
 need_name() { [[ "${1:-}" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] || die "名字只能用字母、数字、- 和 _（最长 32 个字符），例如 g1、pro-01"; }
-mask() { sed -E 's#^([a-z0-9]+://)([^@/]*@)?([^/]+).*#\1\3#' <<<"$1"; }   # 只留 协议://主机:端口，去掉账号密码
+mask() { sed -E 's#^([a-z0-9]+://)(.*@)?([^@/]+).*#\1\3#' <<<"$1"; }   # 只留 协议://主机:端口，去掉账号密码
 no_proxy_ok() { [ "$REQUIRE_PROXY" = 0 ] || [ "$REQUIRE_PROXY" = false ] || [ "$REQUIRE_PROXY" = no ]; }
 
 proxy_of() { [ -f "$ACC/$1/proxy.env" ] || { echo "（不用代理）"; return; }; ( set -a; . "$ACC/$1/proxy.env"; printf '%s' "$HTTPS_PROXY" ); }

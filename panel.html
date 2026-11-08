@@ -97,6 +97,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
     <span class="sp"></span>
     <button class="primary" data-top="add">＋ 添加账号</button>
     <button data-top="quotaAll">刷新全部额度</button>
+    <button data-top="proxies">代理记录</button>
     <button data-top="connect">接入信息</button>
     <button data-top="test">在线测试</button>
     <button data-top="settings">设置</button>
@@ -254,11 +255,13 @@ function verifyModal(name, url) {
 function proxyModal(name) {
   openModal('<h3>' + esc(name) + ' 换代理</h3><div class="field"><label>新的代理地址（例如 socks5://用户名:密码@1.2.3.4:1080）</label><input id="pxIn" type="password" autocomplete="off"></div>' +
     '<label class="small mute"><input type="checkbox" style="width:auto" onchange="pxIn.type=this.checked?\'text\':\'password\'"> 显示</label><p class="small mute">保存前会先测这个代理的出口 IP。保存后这个账号会用新代理重新连接。</p>' +
-    '<p id="pxRes" class="small"></p><div class="foot"><button onclick="closeModal()">取消</button><button class="primary" id="pxSave">测试并保存</button></div>');
+    '<p id="pxRes" class="small"></p><div class="field"><label>已经用过的代理（不要重复用）</label><div id="pxUsed"><span class="spin"></span></div></div>' +
+    '<div class="foot"><button onclick="closeModal()">取消</button><button class="primary" id="pxSave">测试并保存</button></div>');
+  proxyTable(true).then(h => { if ($("#pxUsed")) $("#pxUsed").innerHTML = h; });
   $("#pxSave").onclick = async e => {
     try { const r = await busy(e.target, () => api("/accounts/" + name + "/proxy", {body: {proxy: $("#pxIn").value.trim()}}));
       toast(name + " 已换代理，出口 " + r.egress_ip + " " + (r.country || ""), "ok");
-      if (r.same_ip_as.length) toast("提醒：这个出口 IP 和 " + r.same_ip_as.join("、") + " 一样", "bad");
+      if (r.same_ip_as.length) toast("提醒：这个代理 / 出口 IP 以前被 " + r.same_ip_as.join("、") + " 用过", "bad");
       closeModal(); refresh(); }
     catch (err) { $("#pxRes").innerHTML = '<span class="err">' + esc(err.message) + "</span>"; }
   };
@@ -284,12 +287,14 @@ function addModal() {
     '<div class="field"><label>这个账号专用的代理（例如 socks5://用户名:密码@1.2.3.4:1080；输入时不显示）</label><input id="anProxy" type="password" autocomplete="off"></div>' +
     '<label class="small mute"><input type="checkbox" style="width:auto" onchange="anProxy.type=this.checked?\'text\':\'password\'"> 显示</label>' +
     (DATA?.server?.require_proxy === false ? '<p class="small mute">这个网关允许不用代理，留空就直接用服务器本机网络。</p>' : '<p class="small mute">每个账号最好用一个不同出口 IP 的代理，避免多个账号被 Google 关联。</p>') +
-    '<p id="anRes" class="small"></p><div class="foot"><button onclick="cancelAdd()">取消</button><button class="primary" id="anNext">测试代理并继续</button></div>');
+    '<p id="anRes" class="small"></p><div class="field"><label>已经用过的代理（不要重复用）</label><div id="anUsed"><span class="spin"></span></div></div>' +
+    '<div class="foot"><button onclick="cancelAdd()">取消</button><button class="primary" id="anNext">测试代理并继续</button></div>');
+  proxyTable(true).then(h => { if ($("#anUsed")) $("#anUsed").innerHTML = h; });
   $("#anNext").onclick = async e => {
     const name = $("#anName").value.trim();
     try { const r = await busy(e.target, () => api("/accounts", {body: {name, proxy: $("#anProxy").value.trim()}}));
       let msg = r.egress_ip ? "代理可用，出口 IP " + r.egress_ip + " " + (r.country || "") : "已创建";
-      if (r.same_ip_as.length) msg += "（提醒：和 " + r.same_ip_as.join("、") + " 用的是同一个出口 IP）";
+      if (r.same_ip_as.length) msg += "（提醒：这个代理 / 出口 IP 以前被 " + r.same_ip_as.join("、") + " 用过）";
       toast(msg, r.same_ip_as.length ? "bad" : "ok"); loginModal(name, true); refresh(); }
     catch (err) { $("#anRes").innerHTML = '<span class="err">' + esc(err.message) + "</span>"; }
   };
@@ -336,9 +341,30 @@ async function topAction(what, btn) {
     if (what === "logout") { await api("/logout", {body: {}}); showLogin(); }
     if (what === "quotaAll") { await busy(btn, () => api("/quota-all", {body: {}})); toast("全部额度已刷新", "ok"); refresh(); }
     if (what === "connect") await connectModal();
+    if (what === "proxies") await proxiesModal();
     if (what === "test") await testModal();
     if (what === "settings") settingsModal();
   } catch (err) { toast(err.message, "bad"); }
+}
+
+const PXS = {in_use: "使用中", replaced: "已换下", deleted: "账号已删除", other: "其它地方在用"};
+async function proxyTable(compact) {
+  const rows = (await api("/proxies")).proxies;
+  if (!rows.length) return '<p class="mute small">还没有用过任何代理。</p>';
+  const dup = rows.filter(r => r.shared_with.length).length;
+  return (dup ? '<p class="small err">标红的代理（或出口 IP）被不止一个账号用过：Google 可能把这些账号当成同一个人。</p>' : "") +
+    '<div style="overflow:auto;max-height:' + (compact ? "220px" : "60vh") + '"><table style="width:100%;border-collapse:collapse;font-size:12.5px">' +
+    '<tr class="mute" style="text-align:left"><th style="padding:4px">代理（不含密码）</th><th>出口 IP</th><th>用在</th><th>状态</th><th>首次使用</th></tr>' +
+    rows.map(r => '<tr style="border-top:1px solid var(--line)' + (r.shared_with.length ? ";color:var(--bad)" : "") + '">' +
+      '<td style="padding:5px 4px;word-break:break-all"><code>' + esc(r.proxy) + "</code>" + (r.shared_with.length ? '<div class="small">也被 ' + esc(r.shared_with.join("、")) + " 用过</div>" : "") + "</td>" +
+      "<td>" + esc(r.ip || "?") + (r.country ? " " + esc(r.country) : "") + "</td><td>" + esc(r.where) + "</td><td>" + esc(PXS[r.status] || r.status) + "</td>" +
+      '<td class="mute">' + (r.at ? esc(new Date(r.at * 1000).toLocaleDateString()) : "") + "</td></tr>").join("") + "</table></div>";
+}
+
+async function proxiesModal() {
+  openModal('<h3>代理记录</h3><p class="small mute">这个网关上用过的每一个代理：账号现在用的、换下来的、已删除账号用过的，以及记录在案的其它服务器在用的。给新账号挑代理时，避开这里已有的（尤其是标红的）。</p>' +
+    '<div id="pxTable"><span class="spin"></span></div><div class="foot"><button onclick="closeModal()">关闭</button></div>');
+  $("#pxTable").innerHTML = await proxyTable(false);
 }
 
 async function connectModal() {

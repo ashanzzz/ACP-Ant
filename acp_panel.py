@@ -143,8 +143,100 @@ def client_ip(request: Request) -> str:
 # ------------------------------------------------------------------------------------------- helpers
 
 def mask_proxy(url: str) -> str:
-    m = re.match(r"^([a-z0-9]+://)(?:[^@/]*@)?([^/]+)", url or "")
+    """scheme://host:port (user and password removed; split at the last '@' in case the password contains one)."""
+    m = re.match(r"^([a-z0-9]+://)(?:.*@)?([^@/]+)", url or "")
     return (m.group(1) + m.group(2)) if m else ""
+
+
+def mask_proxy_user(url: str) -> str:
+    """scheme://user@host:port without the password: tells apart proxies that share one gateway host."""
+    m = re.match(r"^([a-z0-9]+)://(?:(.*)@)?([^@/]+)", url or "")
+    if not m:
+        return ""
+    user = (m.group(2) or "").split(":", 1)[0]
+    return "%s://%s%s" % (m.group(1), (user + "@") if user else "", m.group(3))
+
+
+def history_file() -> str:
+    return os.path.join(core.ROOT, "proxy-history.json")
+
+
+def load_history() -> list[dict]:
+    try:
+        with open(history_file()) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_history(rows: list[dict]) -> None:
+    _write_private(history_file(), json.dumps(rows[-2000:], ensure_ascii=False, indent=1))
+
+
+def remember_proxy(account: str, proxy: str, ip: str, cc: str, at: float | None = None) -> None:
+    """Add (account, proxy) to the proxy history if it is not there yet. Only scheme://user@host:port is kept."""
+    masked = mask_proxy_user(proxy)
+    if not masked:
+        return
+    rows = load_history()
+    for r in rows:
+        if r.get("account") == account and r.get("proxy") == masked and not r.get("note"):
+            r.update({"ip": ip or r.get("ip", ""), "country": cc or r.get("country", ""), "last": time.time()})
+            save_history(rows)
+            return
+    rows.append({"account": account, "proxy": masked, "ip": ip, "country": cc, "at": at or time.time(), "last": time.time(), "note": ""})
+    save_history(rows)
+
+
+def backfill_history() -> None:
+    """Make sure every account's current proxy is in the history (accounts made before the history existed)."""
+    if not os.path.isdir(core.ACCOUNTS_DIR):
+        return
+    for name in sorted(os.listdir(core.ACCOUNTS_DIR)):
+        home = os.path.join(core.ACCOUNTS_DIR, name)
+        px = core.read_proxy(home) if os.path.isdir(home) else {}
+        if px:
+            try:
+                at = os.path.getmtime(os.path.join(home, "proxy.env"))
+            except OSError:
+                at = None
+            remember_proxy(name, px["HTTPS_PROXY"], read_text(os.path.join(home, "egress_ip.txt")),
+                           read_text(os.path.join(home, "egress_country.txt")), at)
+
+
+def proxy_rows() -> list[dict]:
+    """Every proxy ever used, with where it is used now and duplicate flags."""
+    backfill_history()
+    current = {}
+    if os.path.isdir(core.ACCOUNTS_DIR):
+        for name in os.listdir(core.ACCOUNTS_DIR):
+            px = core.read_proxy(os.path.join(core.ACCOUNTS_DIR, name))
+            if px:
+                current[name] = mask_proxy_user(px["HTTPS_PROXY"])
+    rows = []
+    for r in load_history():
+        if r.get("note"):
+            status, where = "other", r["note"]
+        elif r.get("account") in current:
+            status = "in_use" if current[r["account"]] == r.get("proxy") else "replaced"
+            where = r["account"]
+        else:
+            status, where = "deleted", r.get("account", "")
+        rows.append({**r, "status": status, "where": where})
+    # duplicates: one egress IP (or one proxy) used by more than one account / place
+    holders: dict[str, set] = {}
+    for r in rows:
+        for key in filter(None, ("ip:" + r.get("ip", "") if r.get("ip") else "", "px:" + r.get("proxy", ""))):
+            holders.setdefault(key, set()).add(r["where"])
+    for r in rows:
+        others = set()
+        for key in filter(None, ("ip:" + r.get("ip", "") if r.get("ip") else "", "px:" + r.get("proxy", ""))):
+            others |= holders.get(key, set()) - {r["where"]}
+        r["shared_with"] = sorted(others)
+    order = {"in_use": 0, "replaced": 1, "deleted": 2, "other": 3}
+    rows.sort(key=lambda r: (order.get(r["status"], 9), r.get("where", ""), -r.get("last", 0)))
+    return rows
 
 
 def read_text(path: str) -> str:
@@ -209,18 +301,21 @@ async def proxy_test(proxy: str) -> tuple[str, str]:
 
 
 def save_proxy(home: str, proxy: str, ip: str, cc: str) -> list[str]:
+    """Save the account's proxy; returns where else this proxy / egress IP has been used (current, past, other servers)."""
+    name = os.path.basename(home.rstrip("/"))
     os.makedirs(home, exist_ok=True)
     os.chmod(home, 0o700)
+    old = core.read_proxy(home)
+    if old:   # keep the proxy being replaced in the history
+        remember_proxy(name, old["HTTPS_PROXY"], read_text(os.path.join(home, "egress_ip.txt")), read_text(os.path.join(home, "egress_country.txt")))
     _write_private(os.path.join(home, "proxy.env"), "HTTPS_PROXY=%s\nHTTP_PROXY=%s\n" % (shlex.quote(proxy), shlex.quote(proxy)))
     with open(os.path.join(home, "egress_ip.txt"), "w") as f:
         f.write(ip + "\n")
     with open(os.path.join(home, "egress_country.txt"), "w") as f:
         f.write(cc + "\n")
-    same = []
-    for other in sorted(os.listdir(core.ACCOUNTS_DIR)):
-        oh = os.path.join(core.ACCOUNTS_DIR, other)
-        if oh != home and read_text(os.path.join(oh, "egress_ip.txt")) == ip:
-            same.append(other)
+    masked = mask_proxy_user(proxy)
+    same = sorted({r["where"] for r in proxy_rows() if r["where"] != name and (r.get("ip") == ip or r.get("proxy") == masked)})
+    remember_proxy(name, proxy, ip, cc)
     return same
 
 
@@ -402,7 +497,7 @@ def account_view(acc) -> dict:
         "since_start": {"ok": acc.ok, "fail": acc.fail},
         "today": core.STATS.summary(acc.name, 1), "week": core.STATS.summary(acc.name, 7),
         "last_error": acc.last_error, "last_error_at": acc.last_error_at or None,
-        "proxy": mask_proxy(px.get("HTTPS_PROXY", "")) if px else "",
+        "proxy": mask_proxy_user(px.get("HTTPS_PROXY", "")) if px else "",
         "egress_ip": read_text(os.path.join(acc.home, "egress_ip.txt")),
         "country": read_text(os.path.join(acc.home, "egress_country.txt")),
         "quota": q if isinstance(q, list) else None, "quota_error": q.get("error") if isinstance(q, dict) else None,
@@ -636,6 +731,9 @@ async def api_delete(name: str, request: Request):
     acc = core.POOL.accounts.pop(name, None)
     if acc and acc.acp:
         await acc.acp.stop()
+    px = core.read_proxy(home)
+    if px:   # the history keeps proxies of deleted accounts too
+        remember_proxy(name, px["HTTPS_PROXY"], read_text(os.path.join(home, "egress_ip.txt")), read_text(os.path.join(home, "egress_country.txt")))
     shutil.rmtree(home, ignore_errors=True)
     core.event("info", name, "已删除账号（含登录凭据）")
     return {"ok": True}
@@ -674,6 +772,12 @@ async def api_test(request: Request):
     except core.AcpError as e:
         return {"ok": False, "error": "%s：%s" % (e.kind, e), "seconds": round(time.time() - t0, 1)}
     return {"ok": True, "text": "".join(parts), "account": account, "seconds": round(time.time() - t0, 1), "model": model}
+
+
+@router.get("/panel/api/proxies")
+async def api_proxies(request: Request):
+    require(request)
+    return {"proxies": proxy_rows()}
 
 
 @router.get("/panel/api/events")
@@ -755,6 +859,10 @@ def setup(app, module) -> None:
     global core
     core = module
     load_state()
+    try:
+        backfill_history()
+    except Exception as e:  # noqa: BLE001
+        core.log.warning("proxy history backfill failed: %s", e)
     app.include_router(router)
     app.add_api_route("/", page, methods=["GET"], include_in_schema=False)
     app.add_api_route("/panel", page, methods=["GET"], include_in_schema=False)
