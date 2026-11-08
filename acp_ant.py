@@ -1748,9 +1748,8 @@ async def _startup() -> None:
 
 
 async def _prewarm_all() -> None:
-    for acc in list(POOL.accounts.values()):
-        if acc.usable() and acc.acp:
-            await acc.acp.prewarm()
+    # in parallel: one slow account (its first start can take a minute) must not hold up the others
+    await asyncio.gather(*(acc.acp.prewarm() for acc in list(POOL.accounts.values()) if acc.usable() and acc.acp))
 
 
 async def _stats_saver() -> None:
