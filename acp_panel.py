@@ -47,6 +47,7 @@ NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
 PROXY_RE = re.compile(r"^(https?|socks5h?)://\S+:[0-9]{2,5}/?$")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\r")
 DEFAULT_SETTINGS = {"auto_check": True, "check_hours": 6, "prompt_check": False}
+MAX_PER_ACCOUNT = 10      # highest "requests at once per account" the panel offers
 STATE: dict[str, Any] = {}
 FAILS: dict[str, list[float]] = {}
 LOGINS: dict[str, "LoginSession"] = {}
@@ -105,6 +106,9 @@ def load_state() -> None:
     STATE.setdefault("settings", {})
     for k, v in DEFAULT_SETTINGS.items():
         STATE["settings"].setdefault(k, v)
+    n = STATE["settings"].get("per_account")      # set in the panel; otherwise AGY_PER_ACCOUNT from gateway.env
+    if isinstance(n, int) and 1 <= n <= MAX_PER_ACCOUNT:
+        core.POOL.set_limit(n)
 
 
 def _token(exp: int) -> str:
@@ -556,7 +560,8 @@ async def api_overview(request: Request):
         for k in today:
             today[k] += a["today"].get(k, 0)
     return {"server": {"started": STARTED, "now": time.time(), "accounts": len(accs), "usable": sum(1 for a in accs if a["usable"]),
-                       "inflight": sum(a["inflight"] for a in accs), "per_account": core.PER_ACCOUNT, "require_proxy": core.REQUIRE_PROXY,
+                       "inflight": sum(a["inflight"] for a in accs), "waiting": core.POOL.waiting,
+                       "per_account": core.POOL.limit, "per_account_default": core.PER_ACCOUNT, "require_proxy": core.REQUIRE_PROXY,
                        "agy": core.AGY, "initial_password": os.path.exists(init_pw_file())},
             "today": today, "accounts": accs, "settings": STATE["settings"]}
 
@@ -598,6 +603,8 @@ async def api_enabled(name: str, request: Request):
     on = bool((await body_of(request)).get("enabled"))
     _set_enabled(acc.home, on)
     acc.enabled = on
+    if on:
+        core.POOL.wake()     # requests queued for a free slot can use it right away
     core.event("info", name, "已开启" if on else "已关闭（不再被调用）")
     return {"ok": True, "enabled": on}
 
@@ -800,8 +807,17 @@ async def api_settings(request: Request):
         s["check_hours"] = h
     if "prompt_check" in body:
         s["prompt_check"] = bool(body["prompt_check"])
+    if "per_account" in body:
+        try:
+            n = int(body["per_account"])
+        except (TypeError, ValueError):
+            n = 0
+        if not 1 <= n <= MAX_PER_ACCOUNT:
+            raise HTTPException(400, "每个账号同时请求数只能是 1–%d" % MAX_PER_ACCOUNT)
+        s["per_account"] = n
+        core.POOL.set_limit(n)
     save_state()
-    core.event("info", "", "修改了巡检设置：%s" % json.dumps(s, ensure_ascii=False))
+    core.event("info", "", "修改了设置：%s" % json.dumps(s, ensure_ascii=False))
     return {"ok": True, "settings": s}
 
 

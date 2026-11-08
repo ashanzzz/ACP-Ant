@@ -47,7 +47,7 @@ import time
 import urllib.request
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, AsyncIterator
 
@@ -75,8 +75,9 @@ AGY = os.environ.get("AGY_BIN", f"{ROOT}/bin/agy")
 ACCOUNTS_DIR = os.environ.get("AGY_ACCOUNTS", f"{ROOT}/accounts")
 API_KEY = os.environ.get("AGY_GATEWAY_KEY", "")
 AGENT = re.sub(r"[^a-zA-Z0-9_-]", "", os.environ.get("AGY_AGENT", "acpant")) or "acpant"
-PER_ACCOUNT = _env_int("AGY_PER_ACCOUNT", 3)                  # concurrent sessions per account
+PER_ACCOUNT = _env_int("AGY_PER_ACCOUNT", 3)                  # concurrent requests per account (the panel can change it live)
 REQUEST_TIMEOUT = float(os.environ.get("AGY_REQUEST_TIMEOUT", "290"))
+HEARTBEAT = float(os.environ.get("AGY_HEARTBEAT", "15"))       # streams: keep-alive after this many silent seconds; 0 = off
 MAX_CONTINUE = 3                                               # auto-continue when a reply stops at max_tokens
 COOLDOWN_QUOTA = _env_int("AGY_COOLDOWN_QUOTA", 30 * 60)       # quota exhausted
 COOLDOWN_RATE = _env_int("AGY_COOLDOWN_RATE", 90)              # rate limited / overloaded
@@ -406,8 +407,7 @@ class AcpProcess:
 class Account:
     name: str
     home: str
-    sem: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(PER_ACCOUNT))
-    inflight: int = 0
+    inflight: int = 0                 # requests running on this account right now (at most POOL.limit)
     cooldown_until: float = 0.0
     cooldown_kind: str = ""
     disabled_reason: str = ""
@@ -490,6 +490,10 @@ class Pool:
         self.accounts: dict[str, Account] = {}
         self.models_seen: list[str] = []      # model ids offered by Antigravity (learned from session/new)
         self.levels_seen: list[str] = []      # thought levels offered
+        self.limit = max(1, PER_ACCOUNT)      # concurrent requests per account
+        self.waiting = 0                      # requests queued because every account is full
+        self._cond: asyncio.Condition | None = None
+        self._bg: set[asyncio.Task] = set()
 
     def scan(self) -> None:
         """Every sub-directory of ACCOUNTS_DIR with a proxy.env (or, with AGY_REQUIRE_PROXY=0, a .gemini dir) is an account.
@@ -527,8 +531,61 @@ class Pool:
             return None
         # least busy first; among equals the one unused for longest (real round-robin, quota spreads evenly)
         cands.sort(key=lambda a: (a.inflight, a.last_pick))
-        cands[0].last_pick = time.time()
         return cands[0]
+
+    def _condition(self) -> asyncio.Condition:
+        if self._cond is None:
+            self._cond = asyncio.Condition()
+        return self._cond
+
+    async def acquire(self, exclude: set[str], deadline: float) -> Account | None:
+        """A free slot on the least busy usable account. When every account is full the request queues, and whichever
+        account frees a slot first takes the next one in line. None = no usable account left to try."""
+        cond = self._condition()
+        async with cond:
+            self.waiting += 1
+            try:
+                while True:
+                    acc = self.pick(exclude)
+                    if acc is None:
+                        return None
+                    if acc.inflight < self.limit:
+                        acc.inflight += 1
+                        acc.last_pick = time.time()
+                        return acc
+                    left = deadline - time.time()
+                    if left <= 0:
+                        raise AcpError("all accounts are busy (each already runs %d requests); try again shortly" % self.limit, "BUSY")
+                    try:   # woken when a slot frees; look again every few seconds anyway (cooldowns end, accounts come back)
+                        await asyncio.wait_for(cond.wait(), min(left, 5))
+                    except asyncio.TimeoutError:
+                        pass
+            finally:
+                self.waiting -= 1
+
+    def release(self, acc: Account) -> None:
+        acc.inflight -= 1     # no await before this: it also runs while a cancelled request unwinds
+        self.wake()
+
+    def wake(self) -> None:
+        """A slot freed, an account was switched on or the limit raised: let queued requests look again."""
+        cond = self._cond
+        if cond is None or not self.waiting:
+            return
+
+        async def _notify() -> None:
+            async with cond:
+                cond.notify_all()
+        try:
+            t = asyncio.get_running_loop().create_task(_notify())
+        except RuntimeError:
+            return
+        self._bg.add(t)
+        t.add_done_callback(self._bg.discard)
+
+    def set_limit(self, n: int) -> None:
+        self.limit = max(1, int(n))
+        self.wake()
 
 
 POOL = Pool()
@@ -651,64 +708,62 @@ async def generate(model_name: str, system: str, blocks: list[dict], effort_over
     last: AcpError | None = None
     upstream_fails = 0
     while time.time() < deadline:
-        acc = POOL.pick(tried)
+        acc = await POOL.acquire(tried, deadline)
         if acc is None:
             break
         tried.add(acc.name)
         emitted = False
         tok_in = tok_out = 0
-        async with acc.sem:
-            acc.inflight += 1
-            t0 = time.time()
-            try:
-                async for kind, text in run_on(acc, model, effort, system, blocks, deadline):
-                    if kind == "text" and text:
-                        emitted = True
-                    elif kind == "usage":
-                        try:
-                            u = json.loads(text)
-                            tok_in += int(u.get("inputTokens") or 0) + int(u.get("cachedReadTokens") or 0)
-                            tok_out += int(u.get("outputTokens") or 0) + int(u.get("thoughtTokens") or 0)
-                        except (ValueError, TypeError):
-                            pass
-                    yield kind, text, acc.name
-                acc.ok += 1
-                acc.last_ok_at = time.time()
-                STATS.record(acc.name, True, tok_in, tok_out)
-                log.info("ok account=%s model=%s %.1fs", acc.name, model_name, time.time() - t0)
-                return
-            except AcpError as e:
-                last = e
-                acc.fail += 1
-                STATS.record(acc.name, False)
-                acc.last_error, acc.last_error_at = str(e)[:300], time.time()
-                log.warning("fail account=%s kind=%s %.1fs: %s", acc.name, e.kind, time.time() - t0, str(e)[:300])
-                event("warn", acc.name, "%s: %s" % (e.kind, str(e)[:200]))
-                if e.kind in ("QUOTA", "RATE_LIMIT", "VERIFY"):
-                    acc.cooldown_kind = e.kind
-                if e.kind == "QUOTA":
-                    acc.cooldown_until = time.time() + COOLDOWN_QUOTA
-                elif e.kind == "RATE_LIMIT":
-                    acc.cooldown_until = time.time() + COOLDOWN_RATE
-                elif e.kind == "VERIFY":
-                    acc.cooldown_until = time.time() + COOLDOWN_VERIFY   # comes back by itself once verified
-                elif e.kind == "AUTH":
-                    acc.disabled_reason = "needs a new login: " + str(e)[:120]
-                elif e.kind == "CONFIG":
-                    acc.disabled_reason = str(e)[:160]
-                elif e.kind == "TRANSPORT" and acc.acp:
-                    await acc.acp.stop()
-                elif e.kind == "UPSTREAM_LIMIT":
-                    # maybe this account, maybe this prompt: no cooldown, check the real quota in the background,
-                    # and give up after two accounts so one bad prompt cannot walk through the whole pool
-                    upstream_fails += 1
-                    asyncio.create_task(quota_cooldown(acc))
-                    if upstream_fails >= 2:
-                        raise
-                if emitted or e.kind in ("BLOCKED", "UNKNOWN_MODEL", "BAD_REQUEST"):
+        t0 = time.time()
+        try:
+            async for kind, text in run_on(acc, model, effort, system, blocks, deadline):
+                if kind == "text" and text:
+                    emitted = True
+                elif kind == "usage":
+                    try:
+                        u = json.loads(text)
+                        tok_in += int(u.get("inputTokens") or 0) + int(u.get("cachedReadTokens") or 0)
+                        tok_out += int(u.get("outputTokens") or 0) + int(u.get("thoughtTokens") or 0)
+                    except (ValueError, TypeError):
+                        pass
+                yield kind, text, acc.name
+            acc.ok += 1
+            acc.last_ok_at = time.time()
+            STATS.record(acc.name, True, tok_in, tok_out)
+            log.info("ok account=%s model=%s %.1fs", acc.name, model_name, time.time() - t0)
+            return
+        except AcpError as e:
+            last = e
+            acc.fail += 1
+            STATS.record(acc.name, False)
+            acc.last_error, acc.last_error_at = str(e)[:300], time.time()
+            log.warning("fail account=%s kind=%s %.1fs: %s", acc.name, e.kind, time.time() - t0, str(e)[:300])
+            event("warn", acc.name, "%s: %s" % (e.kind, str(e)[:200]))
+            if e.kind in ("QUOTA", "RATE_LIMIT", "VERIFY"):
+                acc.cooldown_kind = e.kind
+            if e.kind == "QUOTA":
+                acc.cooldown_until = time.time() + COOLDOWN_QUOTA
+            elif e.kind == "RATE_LIMIT":
+                acc.cooldown_until = time.time() + COOLDOWN_RATE
+            elif e.kind == "VERIFY":
+                acc.cooldown_until = time.time() + COOLDOWN_VERIFY   # comes back by itself once verified
+            elif e.kind == "AUTH":
+                acc.disabled_reason = "needs a new login: " + str(e)[:120]
+            elif e.kind == "CONFIG":
+                acc.disabled_reason = str(e)[:160]
+            elif e.kind == "TRANSPORT" and acc.acp:
+                await acc.acp.stop()
+            elif e.kind == "UPSTREAM_LIMIT":
+                # maybe this account, maybe this prompt: no cooldown, check the real quota in the background,
+                # and give up after two accounts so one bad prompt cannot walk through the whole pool
+                upstream_fails += 1
+                asyncio.create_task(quota_cooldown(acc))
+                if upstream_fails >= 2:
                     raise
-            finally:
-                acc.inflight -= 1
+            if emitted or e.kind in ("BLOCKED", "UNKNOWN_MODEL", "BAD_REQUEST"):
+                raise
+        finally:
+            POOL.release(acc)
     raise last or AcpError("no usable Antigravity account (all cooling down, logged out or disabled)", "NO_ACCOUNT")
 
 
@@ -1254,8 +1309,46 @@ def check_key(request: Request) -> None:
         raise HTTPException(401, "unauthorized")
 
 
+SSE_PING = ": keep-alive\n\n"                                       # an SSE comment: every client skips it
+ANTHROPIC_PING = 'event: ping\ndata: {"type": "ping"}\n\n'           # Anthropic's own keep-alive event
+
+
+async def with_heartbeat(events: AsyncIterator[str], ping: str = SSE_PING) -> AsyncIterator[str]:
+    """While the model thinks, writes a long tool call or waits for a free account, a stream sends nothing. Proxies
+    then drop the connection (Cloudflare after 100 s without data), so after HEARTBEAT silent seconds send a ping."""
+    if HEARTBEAT <= 0:
+        async for e in events:
+            yield e
+        return
+    q: asyncio.Queue = asyncio.Queue()
+    end = object()
+
+    async def pump() -> None:
+        try:
+            async for e in events:
+                q.put_nowait(e)
+            q.put_nowait(end)
+        except Exception as e:  # noqa: BLE001   (handed to the reader)
+            q.put_nowait(e)
+    task = asyncio.create_task(pump())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(q.get(), HEARTBEAT)
+            except asyncio.TimeoutError:
+                yield ping
+                continue
+            if item is end:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        task.cancel()     # client gone: stop the generation (frees the account slot)
+
+
 ERR_STATUS = {"QUOTA": 429, "RATE_LIMIT": 429, "UPSTREAM_LIMIT": 429, "NO_ACCOUNT": 503, "TIMEOUT": 504, "BLOCKED": 400, "UNKNOWN_MODEL": 400,
-              "BAD_REQUEST": 400, "AUTH": 503}
+              "BAD_REQUEST": 400, "AUTH": 503, "BUSY": 503}
 
 
 def _wire_calls(calls: list[dict], prefix: str) -> list[dict]:
@@ -1330,7 +1423,7 @@ async def chat_completions(request: Request):
                 log.exception("stream failed")
                 yield "data: %s\n\n" % json.dumps({"error": {"message": str(e)[:300], "type": "server_error", "code": "SERVER"}})
             yield "data: [DONE]\n\n"
-        return StreamingResponse(sse(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        return StreamingResponse(with_heartbeat(sse()), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     u, parts, acc_name = Usage(), [], ""
     try:
@@ -1356,7 +1449,8 @@ async def chat_completions(request: Request):
 
 ANTHROPIC_ERR = {"QUOTA": (429, "rate_limit_error"), "RATE_LIMIT": (429, "rate_limit_error"), "UPSTREAM_LIMIT": (429, "rate_limit_error"), "NO_ACCOUNT": (529, "overloaded_error"),
                  "TIMEOUT": (504, "api_error"), "BLOCKED": (400, "invalid_request_error"), "UNKNOWN_MODEL": (400, "not_found_error"),
-                 "BAD_REQUEST": (400, "invalid_request_error"), "AUTH": (529, "overloaded_error")}
+                 "BAD_REQUEST": (400, "invalid_request_error"), "AUTH": (529, "overloaded_error"),
+                 "BUSY": (529, "overloaded_error")}
 
 
 @app.post("/v1/messages")
@@ -1431,7 +1525,7 @@ async def messages(request: Request):
             except Exception as e:  # noqa: BLE001
                 log.exception("stream failed")
                 yield ev("error", {"type": "error", "error": {"type": "api_error", "message": str(e)[:300]}})
-        return StreamingResponse(sse(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        return StreamingResponse(with_heartbeat(sse(), ANTHROPIC_PING), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     u, parts = Usage(), []
     try:
@@ -1464,7 +1558,7 @@ async def count_tokens(request: Request):
 
 RESPONSES_ERR = {"QUOTA": "rate_limit_exceeded", "RATE_LIMIT": "rate_limit_exceeded", "UPSTREAM_LIMIT": "rate_limit_exceeded",
                  "NO_ACCOUNT": "server_is_overloaded", "TIMEOUT": "server_error", "BLOCKED": "invalid_prompt",
-                 "UNKNOWN_MODEL": "model_not_found", "BAD_REQUEST": "invalid_request"}
+                 "UNKNOWN_MODEL": "model_not_found", "BAD_REQUEST": "invalid_request", "BUSY": "server_is_overloaded"}
 
 
 @app.post("/v1/responses")
@@ -1574,7 +1668,7 @@ async def responses(request: Request):
             except Exception as e:  # noqa: BLE001
                 log.exception("stream failed")
                 yield ev("response.failed", {"response": resp("failed", out_items, error={"code": "server_error", "message": str(e)[:300]})})
-        return StreamingResponse(sse(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        return StreamingResponse(with_heartbeat(sse()), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     u, parts = Usage(), []
     try:
@@ -1682,7 +1776,7 @@ async def status(request: Request, quota: int = 0):
         if quota:
             row["quota"] = await read_quota(a)
         out.append(row)
-    return {"accounts": out, "per_account": PER_ACCOUNT}
+    return {"accounts": out, "per_account": POOL.limit, "waiting": POOL.waiting}
 
 
 @app.post("/admin/reset/{name}")

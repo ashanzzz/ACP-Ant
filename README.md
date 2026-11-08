@@ -87,6 +87,7 @@ cd ACP-Ant
 - **添加账号向导**：填名字和代理 → 自动测出口 IP（同一 IP 被别的账号用过会提醒）→ 点按钮打开 Google 登录页，
   把授权码或落地页网址粘贴回面板 → 自动检测，通过后自动开启。登录全程在你自己的浏览器里完成，面板只转交授权码，不保存。
 - **接入信息**：接口地址、一键复制密钥、全部模型名、Codex / PI-Desktop / curl 配置示例。**在线测试**：选模型发一句话。**最近事件**：换号、出错、开关等记录。
+- **同时请求数**：首页显示「正在处理 / 同时上限」和排队数；在「设置」里改每个账号同时处理几个（1–10，默认 3），保存后立即生效。
 - **自动巡检（保活）**：默认每 6 小时给每个开启的账号读一次额度——**不消耗额度**，顺便刷新 Google 登录令牌、确认代理和登录都正常；
   发现登录失效会标成「需要重新登录」。可选每天再真发一句话，提前发现「需要 Google 验证」（每天消耗一次极小的额度）。
 
@@ -218,13 +219,21 @@ ACP 协议本身只能让 Antigravity 调用它自己那边的工具，不能把
 
 高思考档非常慢，复杂长文一次可能要几分钟，一般用 `medium` 就够了。
 
+**同时请求数和排队**：每个账号同时处理 `AGY_PER_ACCOUNT` 个请求（默认 3，面板「设置」里可以直接改），N 个账号就是同时 N×3 个。
+超出的请求排队，**不报错**：哪个账号先空出来就交给哪个，先来先得；排队时间算在单次请求的 290 秒里，超过才返回「忙」（OpenAI 格式 503、Anthropic 格式 529）。
+Codex 这类写代码的 Agent 是「发请求 → 本机执行工具 → 再发请求」一步一步来的，一个任务同时只占 1 个位子。
+Google 没有公布同一账号同时几个请求的上限（官方 IDE 本身就支持一个账号同时跑多个 Agent），真正的限制是每个账号的 5 小时 / 每周额度；想同时服务更多人，最稳的办法是加账号。
+
+**流式心跳**：模型思考、写很长的工具调用、排队等位子时，流式回复可能很久没有数据。Cloudflare 等反向代理 100 秒收不到数据就会断开连接，
+所以流式回复静默超过 `AGY_HEARTBEAT` 秒（默认 15）时，网关发一个心跳：OpenAI 两种格式发 SSE 注释行 `: keep-alive`（客户端按标准会忽略），Anthropic 格式发官方的 `ping` 事件。非流式请求没有心跳，走 Cloudflare 时单次超过 100 秒会被断开，长任务请用流式。
+
 ACP 协议没有 `temperature`、`max_tokens` 参数，这两个字段会被忽略。回复被截断时，网关会在同一个会话里让模型接着写，最多 3 次。
 
 ## 管理接口（都要带密钥）
 
 | 接口 | 作用 |
 |---|---|
-| `GET /admin/status` | 每个账号的状态：能不能用、正在跑几个、成功 / 失败次数、冷却剩余秒数、最近一次错误 |
+| `GET /admin/status` | 每个账号的状态：能不能用、正在跑几个、成功 / 失败次数、冷却剩余秒数、最近一次错误；以及每账号上限 `per_account` 和排队数 `waiting` |
 | `GET /admin/status?quota=1` | 再加上每个账号的剩余额度（每周和 5 小时两个窗口；查询本身不消耗额度，缓存 10 分钟） |
 | `POST /admin/reset/{名字}` | 重新登录或换代理后，清掉这个账号的冷却 / 停用标记，并重启它的进程 |
 | `GET /healthz` | 存活检查（不需要密钥，只返回账号数） |
@@ -242,6 +251,7 @@ ACP 协议没有 `temperature`、`max_tokens` 参数，这两个字段会被忽�
 | 登录失效 | 停用这个账号，`account.sh login` 后再 `/admin/reset` | 全部不可用时 503 |
 | 被 Antigravity 审核拦截 | 不换号（换了也一样） | 400 |
 | 模型名不存在（关了兜底时） | 不换号 | 400 |
+| 所有账号都满了 | 排队，哪个账号先空出来就交给哪个 | 290 秒内没排上：503（Anthropic 格式 529） |
 | 超时 | 默认 290 秒 | 504 |
 
 Anthropic 格式下，「没有可用账号」返回 529（overloaded），Claude 系客户端会自动重试。冷却时间等所有选项见 [gateway.env.example](gateway.env.example)。
@@ -292,7 +302,8 @@ ACP-Ant turns Google's official **Antigravity CLI (`agy`)** into a standard LLM 
 - **Three APIs:** `/v1/chat/completions`, `/v1/responses` (used by Codex CLI) and `/v1/messages`, all with streaming.
 - **Tool calling:** OpenAI `tools`, Anthropic `tools`, and Responses function and custom tools are described to the model. Its requests come back as native `tool_calls` / `tool_use` / `function_call` items. Your agent runs the tools; Antigravity itself has no tools and every permission request is refused.
 - **Isolation:** each account has its own HOME directory, so credentials stay separate, and optionally its own HTTP/SOCKS5 proxy.
-- **Load spreading:** requests go to the least busy account, round-robin among equals.
+- **Load spreading:** requests go to the least busy account, round-robin among equals. Each account runs up to 3 requests at once (`AGY_PER_ACCOUNT`, also settable live in the panel). Extra requests queue, first come first served, for whichever account frees a slot first.
+- **Stream keep-alive:** after 15 silent seconds (`AGY_HEARTBEAT`), a stream sends an SSE comment or an Anthropic `ping` event, so Cloudflare and other proxies don't cut long thinking or long tool calls. Cloudflare cuts a connection after 100 s with no data.
 - **Failover:** quota, rate-limit and "verify your account" errors put that account on cooldown and move to the next one. Expired logins disable the account.
 - **Soft errors:** Antigravity reports prompt-filter refusals, "Verification Required" and upstream API errors as plain text, sometimes after minutes of internal retries. ACP-Ant recognises them within seconds and returns proper error codes.
 - **Unknown model names** fall back to the default model, which can be turned off.

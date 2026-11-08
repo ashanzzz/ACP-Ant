@@ -171,7 +171,8 @@ function render() {
     ["账号", s.usable + " / " + s.accounts, "可用 / 总数"],
     ["今日请求", t.ok + " / " + t.fail, "成功 / 失败"],
     ["今日 Token", num(t.in) + " / " + num(t.out), "输入 / 输出（含思考）"],
-    ["正在处理", s.inflight, "每个账号最多同时 " + s.per_account + " 个"],
+    ["正在处理 / 同时上限", s.inflight + " / " + s.usable * s.per_account,
+     "每个账号同时 " + s.per_account + " 个 · " + (s.waiting ? '<span class="err">排队 ' + s.waiting + " 个</span>" : "无排队")],
   ].map(([a, b, c]) => '<div class="card"><div class="mute small">' + a + '</div><div class="big">' + esc(b) + '</div><div class="mute small">' + c + "</div></div>").join("");
   $("#accounts").innerHTML = DATA.accounts.length ? DATA.accounts.map(cardHtml).join("") :
     '<div class="card">还没有账号。点右上角「＋ 添加账号」，按提示填代理并登录 Google。</div>';
@@ -201,7 +202,7 @@ function cardHtml(a) {
     '<div class="row small"><span class="mute">额度</span> <span class="mute">' + (a.quota_at ? "· " + esc(ago(a.quota_at)) + "读取" : "") + "</span>" + quotaHtml(a) + "</div>" +
     '<div class="row small"><span class="mute">今日</span> 成功 ' + a.today.ok + " · 失败 " + a.today.fail + " · Token " + num(a.today.in) + " / " + num(a.today.out) +
     ' <span class="mute">｜近 7 天</span> ' + a.week.ok + " / " + a.week.fail + "</div>" +
-    '<div class="row small"><span class="mute">正在处理</span> ' + a.inflight + ' <span class="mute">｜上次检测</span> ' + esc(ago(a.last_check_at)) +
+    '<div class="row small"><span class="mute">正在处理</span> ' + a.inflight + " / " + DATA.server.per_account + ' <span class="mute">｜上次检测</span> ' + esc(ago(a.last_check_at)) +
     (a.last_check_msg ? "：" + (a.last_check_ok ? "" : '<span class="err">') + esc(a.last_check_msg) + (a.last_check_ok ? "" : "</span>") : "") + "</div>" +
     (a.last_error ? '<div class="row small"><span class="mute">最近错误（' + esc(ago(a.last_error_at)) + '）</span> <span class="err">' + esc(kindText(a.last_error)).slice(0, 220) + "</span></div>" : "") +
     '<div class="acts">' +
@@ -396,8 +397,13 @@ async function testModal() {
 }
 
 function settingsModal() {
-  const s = DATA.settings;
-  openModal('<h3>设置</h3><h4 style="margin:6px 0">自动巡检（保活）</h4>' +
+  const s = DATA.settings, srv = DATA.server;
+  openModal('<h3>设置</h3><h4 style="margin:6px 0">同时请求数</h4>' +
+    '<div class="field"><label>每个账号同时处理</label><select id="stPer">' + Array.from({length: 10}, (_, i) => i + 1).map(n => '<option value="' + n + '"' + (n === srv.per_account ? " selected" : "") + ">" + n + " 个" + (n === srv.per_account_default ? "（默认）" : "") + "</option>").join("") + "</select></div>" +
+    '<p class="small mute">现在 ' + srv.usable + " 个可用账号 × " + srv.per_account + " = 同时最多 " + srv.usable * srv.per_account + ' 个请求。超出的请求<b>排队，不报错</b>：哪个账号先空出来就交给哪个。Codex 等写代码的工具一次只占 1 个位子。' +
+    'Google 没有公布同一账号同时几个请求的上限，真正的限制是额度；调高后如果常看到「限流 / 429」，就调回来。保存后立即生效。</p>' +
+    '<div class="foot" style="justify-content:flex-start"><button class="primary" id="stPerSave">保存同时请求数</button></div>' +
+    '<h4 style="margin:18px 0 6px">自动巡检（保活）</h4>' +
     '<label><input type="checkbox" id="stAuto" style="width:auto"' + (s.auto_check ? " checked" : "") + '> 定期检查每个开启的账号</label>' +
     '<div class="field"><label>间隔</label><select id="stHours">' + [1, 2, 3, 6, 12, 24].map(h => '<option value="' + h + '"' + (h === s.check_hours ? " selected" : "") + ">每 " + h + " 小时</option>").join("") + '</select></div>' +
     '<p class="small mute">巡检就是读一次额度：<b>不消耗额度</b>，顺便刷新 Google 登录令牌、确认代理和登录都还正常。发现登录失效会把账号标成「需要重新登录」，不再派活给它。</p>' +
@@ -407,6 +413,7 @@ function settingsModal() {
     '<h4 style="margin:18px 0 6px">修改面板密码</h4><div class="field"><input id="pwOld" type="password" placeholder="原密码"></div><div class="field"><input id="pwNew" type="password" placeholder="新密码（至少 8 位）"></div>' +
     '<div class="foot" style="justify-content:flex-start"><button id="pwSave">修改密码</button></div><div class="foot"><button onclick="closeModal()">关闭</button></div>');
   $("#stSave").onclick = async e => { try { await busy(e.target, () => api("/settings", {body: {auto_check: $("#stAuto").checked, check_hours: +$("#stHours").value, prompt_check: $("#stPrompt").checked}})); toast("巡检设置已保存", "ok"); refresh(); } catch (err) { toast(err.message, "bad"); } };
+  $("#stPerSave").onclick = async e => { try { await busy(e.target, () => api("/settings", {body: {per_account: +$("#stPer").value}})); toast("已保存，立即生效", "ok"); closeModal(); refresh(); } catch (err) { toast(err.message, "bad"); } };
   $("#pwSave").onclick = async e => { try { await busy(e.target, () => api("/password", {body: {old: $("#pwOld").value, new: $("#pwNew").value}})); toast("密码已修改，其它设备上的登录已退出", "ok"); closeModal(); refresh(); } catch (err) { toast(err.message, "bad"); } };
 }
 
