@@ -53,11 +53,15 @@ Agent / 应用 ──OpenAI 或 Anthropic 接口──▶ ACP-Ant（127.0.0.1:80
 
 ## 要求
 
-- Linux（x86_64 或 arm64），Python 3.9+，`curl`；用 systemd 装成服务需要 sudo。
+- Linux（x86_64 或 arm64），Python 3.10+，`curl`、`git`；或者只要 Docker。
 - 一个或多个能用 Antigravity 的 Google 账号（例如 Google AI Pro）。
 - 可选：每个账号一个代理节点。
 
 ## 安装
+
+三种方式任选一种，装好以后都在网页控制面板里操作。
+
+### 方式一：系统服务（推荐，需要 sudo）
 
 ```bash
 git clone https://github.com/czg86389-hub/ACP-Ant.git
@@ -67,11 +71,43 @@ cd ACP-Ant
 
 安装脚本会：
 1. 从官方地址（`https://antigravity.google/cli/install.sh`）安装 `agy` 到 `/opt/acp-ant/bin`；
-2. 建 Python 虚拟环境并装依赖（FastAPI、Uvicorn）；
+2. 建 Python 虚拟环境并装依赖（FastAPI、Uvicorn）。缺 `python3-venv` 时，有 apt 就自动补装，否则提示该装哪个包；
 3. 生成随机网关密钥，写进 `/opt/acp-ant/gateway.env`（权限 600）；
 4. 装成 systemd 服务 `acp-ant`，只监听 `127.0.0.1:8095`。
 
 可以用环境变量改安装位置和端口：`AGY_ROOT=/srv/acp-ant AGY_PORT=9000 ./install.sh`；不想装服务就加 `--no-systemd`。
+
+### 方式二：用户服务（不用 sudo）
+
+```bash
+git clone https://github.com/czg86389-hub/ACP-Ant.git
+cd ACP-Ant
+./install.sh --user
+```
+
+装到 `~/acp-ant`，作为当前用户的服务运行（`systemctl --user status acp-ant`，日志 `journalctl --user -u acp-ant -f`）。
+脚本会顺便开启「退出 SSH 后继续运行」（`loginctl enable-linger`）；有的服务器不允许普通用户开，脚本会提示请管理员运行一次 `sudo loginctl enable-linger 你的用户名`。
+请用 SSH 直接登录这个用户再安装（不要 `su` 过去），否则连不上用户的 systemd。
+
+### 方式三：Docker
+
+```bash
+git clone https://github.com/czg86389-hub/ACP-Ant.git
+cd ACP-Ant
+docker compose up -d --build
+cat data/panel-initial-password.txt     # 面板初始密码（可能要 sudo）
+```
+
+- 第一次启动会生成密钥、把官方 `agy` 装进数据目录；账号、密钥、面板密码、统计都在 `./data` 里，删掉重建容器也不会丢。
+- 默认只监听本机 `127.0.0.1:8095`，要绑定域名请在前面加 Caddy / Nginx（见下文）；端口和其它设置在 `docker-compose.yml` 里改。
+- 命令行管账号：`docker compose exec acp-ant account.sh list`（一般用面板就够了）。
+
+### 更新
+
+- 网页控制面板每 6 小时读一次 GitHub 上的 [CHANGELOG.md](CHANGELOG.md)（只读取这一个公开文件，不上传任何数据），有新版本时在顶部提示并列出更新内容。可以在「设置」里关闭，或在 `gateway.env` 里写 `ACPANT_UPDATE_CHECK_HOURS=0` 彻底关掉。
+- 方式一、方式二（`git clone` 安装）：在面板里点 **「立即更新」** 就行。面板会拉取最新代码、装好依赖，等正在处理的请求做完后自动重启，一般 1 分钟内完成；账号、密钥、面板密码和统计都保留。
+- 手动更新：在源码目录运行 `git pull && ./install.sh`（用户服务加 `--user`）。Docker：`git pull && docker compose up -d --build`。
+- 用自己的 fork：`gateway.env` 里写 `ACPANT_UPDATE_REPO=你的用户名/ACP-Ant`。
 
 ## 网页控制面板
 
@@ -87,6 +123,7 @@ cd ACP-Ant
 - **添加账号向导**：填名字和代理 → 自动测出口 IP（同一 IP 被别的账号用过会提醒）→ 点按钮打开 Google 登录页，
   把授权码或落地页网址粘贴回面板 → 自动检测，通过后自动开启。登录全程在你自己的浏览器里完成，面板只转交授权码，不保存。
 - **接入信息**：接口地址、一键复制密钥、全部模型名、Codex / PI-Desktop / curl 配置示例。**在线测试**：选模型发一句话。**最近事件**：换号、出错、开关等记录。
+- **版本更新**：顶部提示新版本和更新内容；`git clone` 安装的点「立即更新」自动拉取、安装、重启（见上文「更新」）。
 - **同时请求数**：首页显示「正在处理 / 同时上限」和排队数；在「设置」里改每个账号同时处理几个（1–10，默认 3），保存后立即生效。
 - **自动巡检（保活）**：默认每 6 小时给每个开启的账号读一次额度——**不消耗额度**，顺便刷新 Google 登录令牌、确认代理和登录都正常；
   发现登录失效会标成「需要重新登录」。可选每天再真发一句话，提前发现「需要 Google 验证」（每天消耗一次极小的额度）。
@@ -321,6 +358,15 @@ ACP-Ant turns Google's official **Antigravity CLI (`agy`)** into a standard LLM 
 - `scripts/agent_test.py` passes tool calling on all three APIs: first call, round trip with the result, streaming, JSON mode and custom tools.
 
 **Not supported:** Claude Code. Google's Antigravity backend refuses requests that carry Claude Code's `x-anthropic-billing-header` line or its identity sentence, answering `RESOURCE_EXHAUSTED (429)`. ACP-Ant does not work around this; it returns a 429 within seconds instead of hanging.
+
+Install, choose one:
+- `./install.sh`: system service, needs sudo.
+- `./install.sh --user`: user service via `systemctl --user`, no sudo.
+- `docker compose up -d --build`: Docker; everything persists in `./data`.
+
+If `python3-venv` is missing, the installer adds it when apt and sudo are available. Otherwise it names the package to install. It no longer leaves a venv without pip behind.
+
+**Updates:** every 6 hours the panel reads `CHANGELOG.md` from GitHub and shows a banner when a newer version exists. For `git clone` installs, **Update now** in the panel runs `git pull` and `install.sh --update`, then restarts the service. Turn the check off with `ACPANT_UPDATE_CHECK_HOURS=0`.
 
 ```bash
 git clone https://github.com/czg86389-hub/ACP-Ant.git && cd ACP-Ant && ./install.sh

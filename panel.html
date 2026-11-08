@@ -165,8 +165,11 @@ async function refresh() {
 
 function render() {
   const s = DATA.server, t = DATA.today;
-  $("#srvPill").innerHTML = '<span class="dot ok"></span><span>运行中 · 已运行 ' + esc(ago(s.started).replace("前", "")) + "</span>";
-  $("#banner").innerHTML = s.initial_password ? '<div class="banner">你还在用初始密码。建议点右上角「设置」改成自己的密码（改完服务器上的初始密码文件会自动删除）。</div>' : "";
+  $("#srvPill").innerHTML = '<span class="dot ok"></span><span>运行中 · v' + esc(s.version) + " · 已运行 " + esc(ago(s.started).replace("前", "")) + "</span>";
+  const u = DATA.update || {};
+  $("#banner").innerHTML = (s.initial_password ? '<div class="banner">你还在用初始密码。建议点右上角「设置」改成自己的密码（改完服务器上的初始密码文件会自动删除）。</div>' : "") +
+    (u.available ? '<div class="banner">🎉 发现新版本 <b>v' + esc(u.latest) + "</b>（当前 v" + esc(u.current) + '）。 <button class="primary" onclick="updateModal()">查看更新内容' + (u.can_apply ? "并更新" : "") + "</button></div>" : "") +
+    (u.state === "running" || u.state === "restarting" ? '<div class="banner"><span class="spin"></span> 正在更新… <button onclick="updateModal()">查看进度</button></div>' : "");
   $("#summary").innerHTML = [
     ["账号", s.usable + " / " + s.accounts, "可用 / 总数"],
     ["今日请求", t.ok + " / " + t.fail, "成功 / 失败"],
@@ -396,9 +399,63 @@ async function testModal() {
   };
 }
 
+function notesHtml(notes) {
+  if (!notes || !notes.length) return "";
+  return '<div class="card" style="max-height:260px;overflow:auto;margin:8px 0">' + notes.map(n =>
+    '<div style="margin-bottom:8px"><b>v' + esc(n.version) + "</b>" + (n.title ? ' <span class="mute small">' + esc(n.title) + "</span>" : "") +
+    n.lines.map(l => '<div class="small">' + esc(l.replace(/^\s*[-*]\s*/, "• ")) + "</div>").join("") + "</div>").join("") + "</div>";
+}
+function manualHtml(u) {
+  const src = u.src || "你 git clone 下来的 ACP-Ant 目录";
+  if (u.why === "docker") return '<p class="small">这是 Docker 版。在服务器上 <code>docker-compose.yml</code> 所在的目录运行：</p><pre class="small">git pull && docker compose up -d --build</pre><p class="small mute">账号、密钥、面板密码都在数据卷里，不受影响。</p>';
+  const flag = u.mode === "user" ? " --user" : "";
+  return '<p class="small">这台不能在面板里一键更新（' + esc({nogit: "源码目录不是 git 仓库", nosystemd: "网关不是由 systemd 服务启动的", manual: "不是用 install.sh 安装的"}[u.why] || u.why) +
+    '）。在服务器上运行：</p><pre class="small">cd ' + esc(src) + " && git pull && ./install.sh" + flag + '</pre><p class="small mute">重新运行 install.sh 就是升级：保留 gateway.env、账号、面板密码和统计。</p>';
+}
+let UPD_TIMER = null;
+async function updateModal() {
+  let u;
+  try { u = await api("/update"); } catch (e) { toast(e.message, "bad"); return; }
+  const busyNow = u.state === "running" || u.state === "restarting";
+  openModal("<h3>版本更新</h3>" +
+    '<p class="small">当前版本 <b>v' + esc(u.current) + "</b>" + (u.latest ? " · GitHub 最新 <b>v" + esc(u.latest) + "</b>" : "") +
+    (u.checked_at ? ' <span class="mute">（' + esc(ago(u.checked_at)) + "检查）</span>" : "") + "</p>" +
+    (u.error ? '<p class="small err">' + esc(u.error) + "</p>" : "") +
+    (u.available ? notesHtml(u.notes) : (u.latest ? '<p class="small" style="color:var(--ok)">已经是最新版本。</p>' : "")) +
+    (u.available && !busyNow ? (u.can_apply ? '<p class="small mute">「立即更新」会从 GitHub 拉取最新代码、装好依赖，等正在处理的请求做完后自动重启网关（一般 1 分钟内）。账号、密钥、面板密码和统计都保留。</p>' : manualHtml(u)) : "") +
+    '<pre class="small" id="updLog" style="max-height:220px;overflow:auto;white-space:pre-wrap;display:' + (u.log ? "block" : "none") + '">' + esc(u.log || "") + "</pre>" +
+    '<div class="foot"><button id="updCheck">立即检查</button>' + (u.available && u.can_apply && !busyNow ? '<button class="primary" id="updApply">立即更新</button>' : "") +
+    '<button onclick="closeModal()">关闭</button></div>');
+  $("#updCheck").onclick = async e => { try { await busy(e.target, () => api("/update/check", {body: {}})); await refresh(); updateModal(); } catch (err) { toast(err.message, "bad"); } };
+  if ($("#updApply")) $("#updApply").onclick = async e => {
+    if (!confirm("现在更新到 v" + u.latest + "？更新完网关会自动重启一次。")) return;
+    try { await busy(e.target, () => api("/update/apply", {body: {}})); followUpdate(u.current); } catch (err) { toast(err.message, "bad"); }
+  };
+  if (busyNow) followUpdate(u.current);
+}
+function followUpdate(fromVersion) {
+  clearInterval(UPD_TIMER);
+  const t0 = Date.now();
+  UPD_TIMER = setInterval(async () => {
+    try {
+      const u = await api("/update");
+      const log = $("#updLog");
+      if (log) { log.style.display = "block"; log.textContent = u.log || "正在开始…"; log.scrollTop = log.scrollHeight; }
+      if (u.current !== fromVersion) { clearInterval(UPD_TIMER); toast("已更新到 v" + u.current, "ok"); closeModal(); refresh(); return; }
+      if (u.state === "failed") { clearInterval(UPD_TIMER); toast("更新失败，网关还在用 v" + fromVersion + "（看窗口里的日志）", "bad"); }
+    } catch (e) { const log = $("#updLog"); if (log) log.textContent += "\n…网关正在重启"; }
+    if (Date.now() - t0 > 20 * 60 * 1000) clearInterval(UPD_TIMER);
+  }, 2500);
+}
+
 function settingsModal() {
-  const s = DATA.settings, srv = DATA.server;
-  openModal('<h3>设置</h3><h4 style="margin:6px 0">同时请求数</h4>' +
+  const s = DATA.settings, srv = DATA.server, u = DATA.update || {};
+  openModal('<h3>设置</h3><h4 style="margin:6px 0">版本更新</h4>' +
+    '<p class="small">当前版本 <b>v' + esc(srv.version) + "</b>" + (u.latest ? (u.available ? ' · <span class="err">有新版本 v' + esc(u.latest) + "</span>" : " · 已是最新") : "") +
+    (u.checked_at ? ' <span class="mute">（' + esc(ago(u.checked_at)) + "检查）</span>" : "") + "</p>" +
+    '<label><input type="checkbox" id="stUpd" style="width:auto"' + (s.update_check !== false ? " checked" : "") + (u.every_hours > 0 ? "" : " disabled") + "> 自动检查新版本（每 " + (u.every_hours || 6) + " 小时读一次 GitHub 上的更新日志，不上传任何数据）</label>" +
+    '<div class="foot" style="justify-content:flex-start"><button id="stUpdSave">保存</button><button id="stUpdOpen">检查 / 更新…</button></div>' +
+    '<h4 style="margin:18px 0 6px">同时请求数</h4>' +
     '<div class="field"><label>每个账号同时处理</label><select id="stPer">' + Array.from({length: 10}, (_, i) => i + 1).map(n => '<option value="' + n + '"' + (n === srv.per_account ? " selected" : "") + ">" + n + " 个" + (n === srv.per_account_default ? "（默认）" : "") + "</option>").join("") + "</select></div>" +
     '<p class="small mute">现在 ' + srv.usable + " 个可用账号 × " + srv.per_account + " = 同时最多 " + srv.usable * srv.per_account + ' 个请求。超出的请求<b>排队，不报错</b>：哪个账号先空出来就交给哪个。Codex 等写代码的工具一次只占 1 个位子。' +
     'Google 没有公布同一账号同时几个请求的上限，真正的限制是额度；调高后如果常看到「限流 / 429」，就调回来。保存后立即生效。</p>' +
@@ -413,6 +470,8 @@ function settingsModal() {
     '<h4 style="margin:18px 0 6px">修改面板密码</h4><div class="field"><input id="pwOld" type="password" placeholder="原密码"></div><div class="field"><input id="pwNew" type="password" placeholder="新密码（至少 8 位）"></div>' +
     '<div class="foot" style="justify-content:flex-start"><button id="pwSave">修改密码</button></div><div class="foot"><button onclick="closeModal()">关闭</button></div>');
   $("#stSave").onclick = async e => { try { await busy(e.target, () => api("/settings", {body: {auto_check: $("#stAuto").checked, check_hours: +$("#stHours").value, prompt_check: $("#stPrompt").checked}})); toast("巡检设置已保存", "ok"); refresh(); } catch (err) { toast(err.message, "bad"); } };
+  $("#stUpdSave").onclick = async e => { try { await busy(e.target, () => api("/settings", {body: {update_check: $("#stUpd").checked}})); toast("已保存", "ok"); refresh(); } catch (err) { toast(err.message, "bad"); } };
+  $("#stUpdOpen").onclick = () => updateModal();
   $("#stPerSave").onclick = async e => { try { await busy(e.target, () => api("/settings", {body: {per_account: +$("#stPer").value}})); toast("已保存，立即生效", "ok"); closeModal(); refresh(); } catch (err) { toast(err.message, "bad"); } };
   $("#pwSave").onclick = async e => { try { await busy(e.target, () => api("/password", {body: {old: $("#pwOld").value, new: $("#pwNew").value}})); toast("密码已修改，其它设备上的登录已退出", "ok"); closeModal(); refresh(); } catch (err) { toast(err.message, "bad"); } };
 }

@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 User=@USER@
 WorkingDirectory=@ROOT@
+Environment=AGY_ROOT=@ROOT@
 EnvironmentFile=@ROOT@/gateway.env
 Environment=PYTHONUNBUFFERED=1
 ExecStart=@ROOT@/venv/bin/uvicorn acp_ant:app --host @HOST@ --port @PORT@ --app-dir @ROOT@ --log-level warning

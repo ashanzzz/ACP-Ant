@@ -33,6 +33,7 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.request
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -46,7 +47,7 @@ SESSION_SECONDS = 7 * 24 * 3600
 NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
 PROXY_RE = re.compile(r"^(https?|socks5h?)://\S+:[0-9]{2,5}/?$")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\r")
-DEFAULT_SETTINGS = {"auto_check": True, "check_hours": 6, "prompt_check": False}
+DEFAULT_SETTINGS = {"auto_check": True, "check_hours": 6, "prompt_check": False, "update_check": True}
 MAX_PER_ACCOUNT = 10      # highest "requests at once per account" the panel offers
 STATE: dict[str, Any] = {}
 FAILS: dict[str, list[float]] = {}
@@ -562,7 +563,8 @@ async def api_overview(request: Request):
     return {"server": {"started": STARTED, "now": time.time(), "accounts": len(accs), "usable": sum(1 for a in accs if a["usable"]),
                        "inflight": sum(a["inflight"] for a in accs), "waiting": core.POOL.waiting,
                        "per_account": core.POOL.limit, "per_account_default": core.PER_ACCOUNT, "require_proxy": core.REQUIRE_PROXY,
-                       "agy": core.AGY, "initial_password": os.path.exists(init_pw_file())},
+                       "agy": core.AGY, "initial_password": os.path.exists(init_pw_file()), "version": core.__version__},
+            "update": update_view(),
             "today": today, "accounts": accs, "settings": STATE["settings"]}
 
 
@@ -807,6 +809,8 @@ async def api_settings(request: Request):
         s["check_hours"] = h
     if "prompt_check" in body:
         s["prompt_check"] = bool(body["prompt_check"])
+    if "update_check" in body:
+        s["update_check"] = bool(body["update_check"])
     if "per_account" in body:
         try:
             n = int(body["per_account"])
@@ -844,6 +848,182 @@ async def api_password(request: Request):
 
 async def page():
     return FileResponse(HTML_FILE, media_type="text/html", headers={"Cache-Control": "no-store"})
+
+
+# ------------------------------------------------------------------------------------------- updates
+# Every few hours read CHANGELOG.md from the GitHub repo (one small public file, nothing is sent). A newer version
+# shows a banner in the panel. Installs made by install.sh from a git clone, running as a systemd service, can update
+# in one click: update.sh (git pull --ff-only + install.sh --update), then the gateway exits and systemd restarts it.
+
+UPDATE_REPO = os.environ.get("ACPANT_UPDATE_REPO", "czg86389-hub/ACP-Ant")
+UPDATE_BRANCH = os.environ.get("ACPANT_UPDATE_BRANCH", "main")
+UPDATE_URL = (os.environ.get("ACPANT_UPDATE_URL") or "https://raw.githubusercontent.com/%s/%s" % (UPDATE_REPO, UPDATE_BRANCH)).rstrip("/")
+try:
+    UPDATE_HOURS = float(os.environ.get("ACPANT_UPDATE_CHECK_HOURS", "6") or 0)   # 0 = never check
+except ValueError:
+    UPDATE_HOURS = 6.0
+_BG: set = set()
+UPDATE: dict[str, Any] = {"latest": None, "checked_at": None, "error": "", "notes": [], "state": "idle", "log": "", "started_at": None}
+
+
+def _vtuple(v: Any) -> tuple[int, int, int]:
+    m = re.match(r"^\s*v?(\d+)\.(\d+)\.(\d+)", str(v or ""))
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else (0, 0, 0)
+
+
+def parse_changelog(text: str) -> list[dict]:
+    """'## 1.2.0 — 2026-11-09' headings with '- ...' lines below -> [{version, title, lines}]."""
+    out: list[dict] = []
+    cur: dict | None = None
+    for line in text.splitlines():
+        m = re.match(r"^##\s+v?(\d+\.\d+\.\d+)\s*(.*)$", line)
+        if m:
+            cur = {"version": m.group(1), "title": m.group(2).strip(" -—–·"), "lines": []}
+            out.append(cur)
+        elif cur is not None and line.strip() and not line.startswith("#"):
+            cur["lines"].append(line.rstrip()[:400])
+    return out
+
+
+def _fetch_text(url: str) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "ACP-Ant/%s (update check)" % core.__version__, "Cache-Control": "no-cache"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.read(300_000).decode("utf-8", "replace")
+
+
+def install_info() -> dict:
+    if os.environ.get("ACPANT_INSTALL") == "docker":
+        return {"mode": "docker"}
+    try:
+        with open(os.path.join(core.ROOT, "install-info.json")) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {"mode": "manual"}
+    except (OSError, ValueError):
+        return {"mode": "manual"}
+
+
+def can_apply(info: dict) -> tuple[bool, str]:
+    """One-click update needs: install.sh install from a git clone, update.sh in place, and systemd to restart us."""
+    mode = info.get("mode")
+    if mode == "docker":
+        return False, "docker"
+    if mode not in ("system", "user"):
+        return False, "manual"
+    src = str(info.get("src") or "")
+    if not src or not os.path.isdir(os.path.join(src, ".git")):
+        return False, "nogit"
+    if not os.path.exists(os.path.join(core.ROOT, "update.sh")) or not shutil.which("git"):
+        return False, "manual"
+    if not os.environ.get("INVOCATION_ID"):     # set by systemd for its services; without it nobody would restart us
+        return False, "nosystemd"
+    return True, ""
+
+
+def update_view(with_log: bool = False) -> dict:
+    info = install_info()
+    ok, why = can_apply(info)
+    latest = UPDATE["latest"]
+    d = {"current": core.__version__, "latest": latest, "available": bool(latest) and _vtuple(latest) > _vtuple(core.__version__),
+         "checked_at": UPDATE["checked_at"], "error": UPDATE["error"], "notes": UPDATE["notes"], "repo": UPDATE_REPO,
+         "auto": bool(STATE.get("settings", {}).get("update_check", True)) and UPDATE_HOURS > 0, "every_hours": UPDATE_HOURS,
+         "mode": info.get("mode"), "src": info.get("src") or "", "can_apply": ok, "why": why, "state": UPDATE["state"]}
+    if with_log:
+        d["log"] = UPDATE["log"][-6000:]
+    return d
+
+
+async def check_update() -> dict:
+    try:
+        secs = parse_changelog(await asyncio.to_thread(_fetch_text, UPDATE_URL + "/CHANGELOG.md"))
+        if not secs:
+            raise ValueError("CHANGELOG.md 里没有版本号")
+        latest = max(secs, key=lambda s: _vtuple(s["version"]))["version"]
+        cur = _vtuple(core.__version__)
+        newer = sorted([s for s in secs if _vtuple(s["version"]) > cur], key=lambda s: _vtuple(s["version"]), reverse=True)
+        UPDATE.update(latest=latest, error="", notes=newer[:10])
+        if _vtuple(latest) > cur and STATE.get("notified_version") != latest:
+            STATE["notified_version"] = latest
+            save_state()
+            core.event("info", "", "发现新版本 %s（当前 %s）：面板顶部可以查看更新内容并更新" % (latest, core.__version__))
+            core.log.warning("a newer ACP-Ant is available: %s (running %s)", latest, core.__version__)
+    except Exception as e:  # noqa: BLE001
+        UPDATE["error"] = ("检查失败：%s" % e)[:200]
+    UPDATE["checked_at"] = time.time()
+    return update_view()
+
+
+async def _run_update(src: str) -> None:
+    env = dict(os.environ, AGY_ROOT=core.ROOT, GIT_TERMINAL_PROMPT="0", LANG="C.UTF-8")
+    rc = -1
+    try:
+        p = await asyncio.create_subprocess_exec("bash", os.path.join(core.ROOT, "update.sh"), src, cwd=src, env=env,
+                                                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+
+        async def pump() -> int:
+            assert p.stdout
+            async for line in p.stdout:
+                UPDATE["log"] = (UPDATE["log"] + line.decode("utf-8", "replace"))[-20000:]
+            return await p.wait()
+        try:
+            rc = await asyncio.wait_for(pump(), 900)
+        except asyncio.TimeoutError:
+            p.kill()
+            UPDATE["log"] += "\n更新超过 15 分钟，已停止。\n"
+    except Exception as e:  # noqa: BLE001
+        UPDATE["log"] += "\n%s\n" % e
+    if rc != 0:
+        UPDATE["state"] = "failed"
+        core.event("warn", "", "更新失败，网关继续用当前版本 %s（面板里能看到出错信息）" % core.__version__)
+        return
+    UPDATE["state"] = "restarting"
+    UPDATE["log"] += "\n==> 文件已更新。等正在处理的请求做完，网关自动重启…\n"
+    core.event("info", "", "新版本文件已就位，网关马上重启")
+    for _ in range(180):     # give running requests up to 3 minutes
+        if not core.POOL.waiting and not any(a.inflight for a in core.POOL.accounts.values()):
+            break
+        await asyncio.sleep(1)
+    await asyncio.sleep(1)
+    core.log.warning("restarting for the update")
+    os.kill(os.getpid(), signal.SIGTERM)       # systemd (Restart=always) starts the new version
+
+
+@router.get("/panel/api/update")
+async def api_update(request: Request):
+    require(request)
+    return update_view(with_log=True)
+
+
+@router.post("/panel/api/update/check")
+async def api_update_check(request: Request):
+    require(request, True)
+    return await check_update()
+
+
+@router.post("/panel/api/update/apply")
+async def api_update_apply(request: Request):
+    require(request, True)
+    info = install_info()
+    ok, why = can_apply(info)
+    if not ok:
+        raise HTTPException(400, "这台不能在面板里一键更新（%s），请按面板上的命令手动更新" % why)
+    if UPDATE["state"] in ("running", "restarting"):
+        raise HTTPException(409, "正在更新，请稍等")
+    UPDATE.update(state="running", log="", started_at=time.time())
+    core.event("info", "", "开始更新（当前 %s）" % core.__version__)
+    t = asyncio.create_task(_run_update(str(info["src"])))
+    _BG.add(t)
+    t.add_done_callback(_BG.discard)
+    return update_view(with_log=True)
+
+
+async def update_loop() -> None:
+    if UPDATE_HOURS <= 0:
+        return
+    await asyncio.sleep(60)
+    while True:
+        if STATE.get("settings", {}).get("update_check", True):
+            await check_update()
+        await asyncio.sleep(max(0.25, UPDATE_HOURS) * 3600)
 
 
 # ------------------------------------------------------------------------------------------- patrol (keep-alive)
@@ -886,6 +1066,7 @@ def setup(app, module) -> None:
     @app.on_event("startup")
     async def _panel_startup() -> None:
         asyncio.create_task(patrol())
+        asyncio.create_task(update_loop())
 
     @app.on_event("shutdown")
     async def _panel_shutdown() -> None:

@@ -54,6 +54,8 @@ from typing import Any, AsyncIterator
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+__version__ = "1.1.0"     # keep in step with the newest heading in CHANGELOG.md (the panel compares against it)
+
 log = logging.getLogger("acp-ant")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
@@ -1299,7 +1301,7 @@ def est_prompt(system: str, blocks: list[dict]) -> int:
 # HTTP API
 # ======================================================================================================
 
-app = FastAPI(title="ACP-Ant", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(title="ACP-Ant", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
 
 
 def check_key(request: Request) -> None:
@@ -1708,7 +1710,7 @@ async def models(request: Request):
 @app.get("/healthz")
 async def healthz():
     POOL.scan()
-    return {"ok": True, "accounts": len(POOL.accounts), "usable": sum(1 for a in POOL.accounts.values() if a.usable())}
+    return {"ok": True, "version": __version__, "accounts": len(POOL.accounts), "usable": sum(1 for a in POOL.accounts.values() if a.usable())}
 
 
 async def read_quota(acc: Account, force: bool = False) -> Any:
@@ -1776,7 +1778,7 @@ async def status(request: Request, quota: int = 0):
         if quota:
             row["quota"] = await read_quota(a)
         out.append(row)
-    return {"accounts": out, "per_account": POOL.limit, "waiting": POOL.waiting}
+    return {"version": __version__, "accounts": out, "per_account": POOL.limit, "waiting": POOL.waiting}
 
 
 @app.post("/admin/reset/{name}")
@@ -1838,7 +1840,7 @@ async def _startup() -> None:
     asyncio.create_task(_stats_saver())
     asyncio.create_task(_prewarm_all())
     event("info", "", "gateway started with %d account(s)" % len(POOL.accounts))
-    log.info("ACP-Ant ready: %d account(s), agent %s", len(POOL.accounts), AGENT)
+    log.info("ACP-Ant %s ready: %d account(s), agent %s", __version__, len(POOL.accounts), AGENT)
 
 
 async def _prewarm_all() -> None:

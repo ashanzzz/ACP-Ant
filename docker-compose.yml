@@ -1,0 +1,19 @@
+# ACP-Ant with Docker:   docker compose up -d --build
+# Panel: http://127.0.0.1:8095/  (first password: cat data/panel-initial-password.txt)
+# Update: git pull && docker compose up -d --build   (accounts, key and panel password stay in ./data)
+services:
+  acp-ant:
+    build: .
+    image: acp-ant:local
+    container_name: acp-ant
+    restart: unless-stopped
+    ports:
+      # only this machine can reach it; put Caddy / Nginx in front for a domain (see README).
+      # To listen on every interface instead: "8095:8095" (then use a strong panel password and the API key).
+      - "127.0.0.1:8095:8095"
+    volumes:
+      - ./data:/data
+    # environment:            # optional, these override data/gateway.env
+    #   AGY_PER_ACCOUNT: "3"
+    #   AGY_REQUIRE_PROXY: "0"
+    #   ACPANT_UPDATE_CHECK_HOURS: "6"

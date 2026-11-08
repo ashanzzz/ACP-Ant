@@ -16,3 +16,8 @@ panel.json
 panel-initial-password.txt
 stats.json
 *.tmp
+
+# Docker 数据目录（账号、密钥、面板密码都在这里），安装记录
+data/
+proxy-history.json
+install-info.json

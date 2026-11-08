@@ -1,0 +1,17 @@
+.git
+.github
+data
+accounts
+venv
+.venv
+bin
+__pycache__
+*.pyc
+*.log
+*.tmp
+gateway.env
+panel.json
+panel-initial-password.txt
+stats.json
+proxy-history.json
+install-info.json
