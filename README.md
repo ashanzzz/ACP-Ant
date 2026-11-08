@@ -1,5 +1,9 @@
 # ACP-Ant
 
+[![认可 LINUX DO 社区](https://img.shields.io/badge/%E8%AE%A4%E5%8F%AF-LINUX%20DO%20%E7%A4%BE%E5%8C%BA-1f6feb)](https://linux.do)
+
+> 本项目积极参与并认可 [LINUX DO 社区](https://linux.do)。
+
 把 Google 官方 **Antigravity CLI（`agy`）** 通过 **ACP 协议（Agent Client Protocol）** 变成标准的大模型接口：
 **OpenAI Chat Completions、OpenAI Responses、Anthropic Messages** 三种格式都支持，带**工具调用（function calling）**，Agent 和应用可以直接接入。
 支持**多个 Google 账号轮流使用，每个账号走自己的代理节点**。
@@ -247,6 +251,12 @@ Anthropic 格式下，「没有可用账号」返回 529（overloaded），Claud
 - 本项目不绕过 Google 的任何限制（比如上面说的 Claude Code）。
 - Antigravity CLI 和 ACP 协议都还在变化，新版本可能改变行为。本项目在 `agy` 1.5.2 上测试通过。
 
+## 社区
+
+本项目积极参与并认可 [LINUX DO 社区](https://linux.do)，欢迎在社区里交流使用心得、反馈问题。
+
+友情链接：[LINUX DO](https://linux.do)
+
 ## 致谢
 
 用 ACP 协议驱动 `agy acp` 的思路来自 [lili-luo/dsh-plugin-bundle](https://github.com/lili-luo/dsh-plugin-bundle) 里的 `dsh-llm-antigravity-acp`（MIT）。本项目是独立实现，并增加了三种标准接口、工具调用、多账号、每账号代理、自动换号、软错误识别、额度查询和会话清理。
@@ -293,5 +303,7 @@ git clone https://github.com/czg86389-hub/ACP-Ant.git && cd ACP-Ant && ./install
 All settings are listed in [gateway.env.example](gateway.env.example).
 
 **Disclaimer:** this is an unofficial tool, not affiliated with Google. Follow the Antigravity terms of service. Sharing a personal subscription with many users or with a commercial service may break those terms and get accounts restricted. Use at your own risk. Tested with `agy` 1.5.2.
+
+**Community:** this project supports and recognizes the [LINUX DO community](https://linux.do).
 
 Inspired by `dsh-llm-antigravity-acp` in [lili-luo/dsh-plugin-bundle](https://github.com/lili-luo/dsh-plugin-bundle) (MIT). Licensed under [MIT](LICENSE).
