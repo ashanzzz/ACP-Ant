@@ -25,6 +25,8 @@ Anthropic `tools`) are described to the model in the system prompt; the model as
 protocol (<tool_calls>[...]</tool_calls>) which the gateway turns back into native tool_calls / tool_use blocks.
 The client agent runs the tools and sends the results back, exactly as with any other model provider.
 ACP has no temperature / max_tokens; those fields are ignored.
+Only text and images reach the model. Video, audio, PDF and other binary files are refused with HTTP 400 instead of
+being dropped (a model that silently misses them still answers, and invents what they contained).
 
 The idea of driving `agy acp` from another program comes from lili-luo/dsh-plugin-bundle
 (dsh-llm-antigravity-acp, MIT). This file is an independent implementation.
@@ -54,7 +56,7 @@ from typing import Any, AsyncIterator
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-__version__ = "1.1.0"     # keep in step with the newest heading in CHANGELOG.md (the panel compares against it)
+__version__ = "1.1.1"     # keep in step with the newest heading in CHANGELOG.md (the panel compares against it)
 
 log = logging.getLogger("acp-ant")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -776,35 +778,105 @@ async def generate(model_name: str, system: str, blocks: list[dict], effort_over
 #         | {"type": "tool_call", "id", "name", "arguments"} | {"type": "tool_result", "id", "name", "text", "is_error"}
 # ======================================================================================================
 
+class BadContent(Exception):
+    """Content the gateway cannot hand to the model. Answered with HTTP 400 (in the format of the API that was called)
+    instead of being dropped: a model that silently misses a video or a PDF still answers, and makes the content up."""
+
+    def __init__(self, message: str, param: str = ""):
+        super().__init__(message)
+        self.param = param
+
+
+# Measured with agy 1.5.3 (ACP promptCapabilities: image yes, audio no, embeddedContext yes): image blocks must be
+# image/*; video, audio and PDF sent as embedded resources or audio blocks are accepted but never reach the model.
+MEDIA_HINT = ("ACP-Ant can pass only text and images to Antigravity; video, audio, PDF and other binary files cannot "
+              "reach the model through Antigravity's ACP interface. Send video as image frames, or use a provider that accepts files")
+
+
+def _unsupported(where: str, what: str) -> BadContent:
+    return BadContent("unsupported content at %s: %s. %s." % (where, what, MEDIA_HINT), where)
+
+
 def _text_part(t: Any) -> list[dict]:
     return [{"type": "text", "text": str(t)}] if t not in (None, "") else []
 
 
-def _image_from_url(url: str) -> dict:
-    mt = re.match(r"data:([\w/+.-]+);base64,(.*)$", url or "", re.S)
-    if mt:
-        return {"type": "image", "mime": mt.group(1), "data": mt.group(2)}
+_TEXT_MIMES = re.compile(r"^(text/[\w.+-]+|application/(json|xml|x-yaml|yaml|x-ndjson|csv))$", re.I)
+
+
+def _data_part(mime: str, data: str, where: str, what: str, name: str = "") -> list[dict]:
+    """Base64 payload with a MIME type: images go through, plain-text files become text, anything else is refused."""
+    mime = (mime or "").strip().lower()
+    if mime.startswith("image/"):
+        return [{"type": "image", "mime": mime, "data": data}]
+    if _TEXT_MIMES.match(mime):
+        try:
+            text = base64.b64decode(data, validate=False).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            raise _unsupported(where, "%s (%s) that is not valid base64 UTF-8 text" % (what, mime))
+        return _text_part("[file %s]\n%s" % (name, text) if name else text)
+    raise _unsupported(where, "%s (%s)" % (what, mime or "unknown type"))
+
+
+def _parse_data_uri(url: str) -> tuple[str, str] | None:
+    mt = re.match(r"data:([\w/+.-]*)(?:;[\w-]+=[^;,]*)*;base64,(.*)$", url or "", re.S)
+    return (mt.group(1), mt.group(2)) if mt else None
+
+
+def _image_from_url(url: str, where: str, what: str = "image") -> dict:
+    d = _parse_data_uri(url)
+    if d:
+        if not d[0].lower().startswith("image/"):
+            raise _unsupported(where, "%s with a %s data URI" % (what, d[0] or "untyped"))
+        return {"type": "image", "mime": d[0].lower(), "data": d[1]}
     if re.match(r"https?://", url or ""):
-        return {"type": "image_url", "url": url}
-    return {"type": "text", "text": "[unreadable image reference]"}
+        return {"type": "image_url", "url": url, "where": where}
+    raise BadContent("%s at %s needs a base64 data: URI or an http(s) URL" % (what, where), where)
 
 
-def _openai_parts(content: Any) -> list[dict]:
+def _openai_file(p: dict, where: str) -> list[dict]:
+    """Chat Completions {"type": "file", "file": {"file_data", "filename"} | {"file_id"}}."""
+    f = p.get("file") if isinstance(p.get("file"), dict) else {}
+    name = str(f.get("filename") or "")
+    d = _parse_data_uri(str(f.get("file_data") or ""))
+    if d:
+        return _data_part(d[0], d[1], where, 'part "file"' + (" " + name if name else ""), name)
+    if f.get("file_id"):
+        raise BadContent('unsupported content at %s: part "file" by file_id (this gateway has no file storage). %s.' % (where, MEDIA_HINT), where)
+    raise _unsupported(where, 'part "file" without file_data')
+
+
+def _openai_parts(content: Any, where: str = "content") -> list[dict]:
     if content is None:
         return []
     if isinstance(content, str):
         return _text_part(content)
+    if not isinstance(content, list):
+        raise BadContent("%s must be a string or a list of content parts" % where, where)
     parts: list[dict] = []
-    for p in content if isinstance(content, list) else []:
+    for i, p in enumerate(content):
+        at = "%s[%d]" % (where, i)
         if not isinstance(p, dict):
-            continue
+            raise BadContent("%s must be an object" % at, at)
         t = p.get("type")
         if t in ("text", "input_text", "output_text"):
             parts += _text_part(p.get("text"))
+        elif t == "refusal":
+            parts += _text_part(p.get("refusal"))
         elif t in ("image_url", "input_image"):
             u = p.get("image_url")
-            parts.append(_image_from_url(str((u.get("url") if isinstance(u, dict) else u) or "")))
+            parts.append(_image_from_url(str((u.get("url") if isinstance(u, dict) else u) or ""), at, 'part "%s"' % t))
+        elif t == "file":
+            parts += _openai_file(p, at)
+        else:   # input_audio, video_url, audio_url, ... : refuse rather than drop
+            raise _unsupported(at, 'part "%s"' % t)
     return parts
+
+
+def _only_text(parts: list[dict], where: str) -> str:
+    if any(p["type"] != "text" for p in parts):
+        raise BadContent("%s can only contain text (put images in a user message)" % where, where)
+    return _joined_text(parts)
 
 
 def _joined_text(parts: list[dict]) -> str:
@@ -819,16 +891,16 @@ def _args_str(a: Any) -> str:
 
 def from_openai(body: dict) -> tuple[str, list[dict], list[dict], Any]:
     system, msgs, names = [], [], {}
-    for m in body.get("messages") or []:
+    for n, m in enumerate(body.get("messages") or []):
         if not isinstance(m, dict):
             continue
-        role = m.get("role")
+        role, where = m.get("role"), "messages[%d].content" % n
         if role in ("system", "developer"):
-            system.append(_joined_text(_openai_parts(m.get("content"))))
+            system.append(_only_text(_openai_parts(m.get("content"), where), where))
         elif role == "user":
-            msgs.append({"role": "user", "parts": _openai_parts(m.get("content"))})
+            msgs.append({"role": "user", "parts": _openai_parts(m.get("content"), where)})
         elif role == "assistant":
-            parts = _openai_parts(m.get("content"))
+            parts = _openai_parts(m.get("content"), where)
             calls = list(m.get("tool_calls") or [])
             if m.get("function_call"):
                 calls.append({"id": "", "function": m["function_call"]})
@@ -839,7 +911,7 @@ def from_openai(body: dict) -> tuple[str, list[dict], list[dict], Any]:
             msgs.append({"role": "assistant", "parts": parts})
         elif role in ("tool", "function"):
             tid = m.get("tool_call_id") or ""
-            content = _openai_parts(m.get("content"))
+            content = _openai_parts(m.get("content"), where)
             msgs.append({"role": "tool", "parts": [{"type": "tool_result", "id": tid, "name": m.get("name") or names.get(tid, ""),
                                                     "text": _joined_text(content), "is_error": False}]
                          + [p for p in content if p["type"] != "text"]})
@@ -860,47 +932,74 @@ def from_openai(body: dict) -> tuple[str, list[dict], list[dict], Any]:
     return "\n\n".join(s for s in system if s), msgs, tools, choice
 
 
-def _anthropic_parts(content: Any) -> list[dict]:
+def _anthropic_skipped(t: str) -> bool:
+    """Blocks the model itself produced on another provider (reasoning, server-side tool calls and their results):
+    leaving them out loses nothing the user sent."""
+    return t in ("thinking", "redacted_thinking", "server_tool_use", "mcp_tool_use") or (t.endswith("_tool_result") and t != "tool_result")
+
+
+def _anthropic_parts(content: Any, where: str = "content") -> list[dict]:
+    if content is None:
+        return []
     if isinstance(content, str):
         return _text_part(content)
+    if not isinstance(content, list):
+        raise BadContent("%s must be a string or a list of content blocks" % where, where)
     parts: list[dict] = []
-    for b in content if isinstance(content, list) else []:
+    for i, b in enumerate(content):
+        at = "%s.%d" % (where, i)
         if not isinstance(b, dict):
-            continue
-        t = b.get("type")
+            raise BadContent("%s must be an object" % at, at)
+        t = str(b.get("type") or "")
+        src = b.get("source") if isinstance(b.get("source"), dict) else {}
+        st = src.get("type")
         if t == "text":
             parts += _text_part(b.get("text"))
         elif t == "image":
-            src = b.get("source") or {}
-            if src.get("type") == "base64":
-                parts.append({"type": "image", "mime": src.get("media_type") or "image/png", "data": src.get("data") or ""})
-            elif src.get("type") == "url":
-                parts.append(_image_from_url(str(src.get("url") or "")))
-        elif t == "document":
-            src = b.get("source") or {}
-            if src.get("type") == "text":
-                parts += _text_part(src.get("data"))
+            if st == "base64":
+                mime = str(src.get("media_type") or "image/png").lower()
+                if not mime.startswith("image/"):
+                    raise _unsupported(at, "image block with media_type %s" % mime)
+                parts.append({"type": "image", "mime": mime, "data": src.get("data") or ""})
+            elif st == "url":
+                parts.append(_image_from_url(str(src.get("url") or ""), at, "image block"))
             else:
-                parts += _text_part("[document omitted: only plain-text documents are supported]")
+                raise _unsupported(at, 'image block with source type "%s"' % st)
+        elif t == "document":
+            title = str(b.get("title") or "")
+            if st == "text":
+                parts += _text_part("[document %s]\n%s" % (title, src.get("data") or "") if title else src.get("data"))
+            elif st == "content":   # a document given as a list of text / image blocks
+                parts += _anthropic_parts(src.get("content"), at + ".source.content")
+            elif st == "base64":
+                parts += _data_part(src.get("media_type") or "", src.get("data") or "", at, "document block", title)
+            else:   # url / file: PDFs, mostly
+                raise _unsupported(at, 'document block with source type "%s"' % st)
+        elif t == "search_result":
+            found = _only_text(_anthropic_parts(b.get("content"), at + ".content"), at + ".content")
+            parts += _text_part("[search result: %s (%s)]\n%s" % (b.get("title") or "", b.get("source") or "", found))
         elif t == "tool_use":
             parts.append({"type": "tool_call", "id": b.get("id") or "", "name": b.get("name") or "", "arguments": _args_str(b.get("input"))})
         elif t == "tool_result":
-            inner = _anthropic_parts(b.get("content"))
+            inner = _anthropic_parts(b.get("content"), at + ".content")
             parts.append({"type": "tool_result", "id": b.get("tool_use_id") or "", "name": "", "text": _joined_text(inner),
                           "is_error": bool(b.get("is_error"))})
             parts += [p for p in inner if p["type"] != "text"]
-        # thinking / redacted_thinking / server tool blocks are not forwarded
+        elif _anthropic_skipped(t):
+            continue
+        else:   # container_upload, audio, video, ... : refuse rather than drop
+            raise _unsupported(at, 'content block "%s"' % t)
     return parts
 
 
 def from_anthropic(body: dict) -> tuple[str, list[dict], list[dict], Any]:
     s = body.get("system")
-    system = s if isinstance(s, str) else _joined_text(_anthropic_parts(s))
+    system = s if isinstance(s, str) else _only_text(_anthropic_parts(s, "system"), "system")
     msgs, names = [], {}
-    for m in body.get("messages") or []:
+    for n, m in enumerate(body.get("messages") or []):
         if not isinstance(m, dict):
             continue
-        parts = _anthropic_parts(m.get("content"))
+        parts = _anthropic_parts(m.get("content"), "messages.%d.content" % n)
         if m.get("role") == "assistant":
             for p in parts:
                 if p["type"] == "tool_call":
@@ -927,22 +1026,38 @@ def from_anthropic(body: dict) -> tuple[str, list[dict], list[dict], Any]:
     return system, msgs, tools, choice
 
 
-def _responses_parts(content: Any) -> list[dict]:
+def _responses_parts(content: Any, where: str = "content") -> list[dict]:
+    if content is None:
+        return []
     if isinstance(content, str):
         return _text_part(content)
+    if not isinstance(content, list):
+        raise BadContent("%s must be a string or a list of content parts" % where, where)
     parts: list[dict] = []
-    for p in content if isinstance(content, list) else []:
+    for i, p in enumerate(content):
+        at = "%s[%d]" % (where, i)
         if not isinstance(p, dict):
-            continue
+            raise BadContent("%s must be an object" % at, at)
         t = p.get("type")
         if t in ("input_text", "output_text", "text", "summary_text"):
             parts += _text_part(p.get("text"))
         elif t == "input_image":
             u = p.get("image_url")
             u = u.get("url") if isinstance(u, dict) else u
-            parts.append(_image_from_url(str(u or "")) if u else {"type": "text", "text": "[image by file id not supported]"})
+            if not u:
+                raise BadContent('unsupported content at %s: part "input_image" by file_id (this gateway has no file storage); '
+                                 'send image_url as a data: URI or an http(s) URL' % at, at)
+            parts.append(_image_from_url(str(u), at, 'part "input_image"'))
+        elif t == "input_file":
+            name = str(p.get("filename") or "")
+            d = _parse_data_uri(str(p.get("file_data") or ""))
+            if not d:
+                raise _unsupported(at, 'part "input_file"%s by %s' % (" " + name if name else "", "file_id" if p.get("file_id") else "URL" if p.get("file_url") else "reference"))
+            parts += _data_part(d[0], d[1], at, 'part "input_file"' + (" " + name if name else ""), name)
         elif t == "refusal":
             parts += _text_part(p.get("refusal"))
+        else:   # input_audio, ... : refuse rather than drop
+            raise _unsupported(at, 'part "%s"' % t)
     return parts
 
 
@@ -961,14 +1076,15 @@ def from_responses(body: dict) -> tuple[str, list[dict], list[dict], Any, set[st
     items = body.get("input")
     if isinstance(items, str):
         items = [{"type": "message", "role": "user", "content": items}]
-    for it in items or []:
+    for n, it in enumerate(items or []):
         if not isinstance(it, dict):
             continue
         t = it.get("type") or ("message" if it.get("role") else "")
         if t == "message":
-            role, parts = it.get("role"), _responses_parts(it.get("content"))
+            where = "input[%d].content" % n
+            role, parts = it.get("role"), _responses_parts(it.get("content"), where)
             if role in ("system", "developer"):
-                system.append(_joined_text(parts))
+                system.append(_only_text(parts, where))
             else:
                 add("assistant" if role == "assistant" else "user", parts)
         elif t in ("function_call", "custom_tool_call"):
@@ -979,7 +1095,7 @@ def from_responses(body: dict) -> tuple[str, list[dict], list[dict], Any, set[st
         elif t in ("function_call_output", "custom_tool_call_output"):
             cid = it.get("call_id") or ""
             out = it.get("output")
-            parts = _text_part(out) if isinstance(out, str) else _responses_parts(out)
+            parts = _text_part(out) if isinstance(out, str) else _responses_parts(out, "input[%d].output" % n)
             add("tool", [{"type": "tool_result", "id": cid, "name": names.get(cid, ""), "text": _joined_text(parts), "is_error": False}]
                 + [p for p in parts if p["type"] != "text"])
         # reasoning items, web search calls etc. are not forwarded
@@ -1114,28 +1230,45 @@ def to_acp(system: str, msgs: list[dict], tools: list[dict], choice: Any, extra_
     return "\n\n".join(s for s in sys_parts if s), blocks
 
 
+_IMAGE_MAGIC = ((b"\x89PNG\r\n\x1a\n", "image/png"), (b"\xff\xd8\xff", "image/jpeg"), (b"GIF87a", "image/gif"), (b"GIF89a", "image/gif"))
+
+
+def _sniff_image(data: bytes) -> str | None:
+    for magic, mime in _IMAGE_MAGIC:
+        if data.startswith(magic):
+            return mime
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
 def _fetch_image(url: str) -> dict:
     req = urllib.request.Request(url, headers={"User-Agent": "acp-ant"})
     with urllib.request.urlopen(req, timeout=20) as r:
         data = r.read(20 * 1024 * 1024 + 1)
         if len(data) > 20 * 1024 * 1024:
             raise ValueError("image larger than 20 MB")
-        mime = (r.headers.get_content_type() or "image/jpeg")
-    return {"type": "image", "mime": mime if mime.startswith("image/") else "image/jpeg", "data": base64.b64encode(data).decode()}
+        ctype = (r.headers.get("Content-Type") and r.headers.get_content_type() or "").lower()
+    mime = ctype if ctype.startswith("image/") else _sniff_image(data)   # some storage servers say application/octet-stream
+    if not mime:
+        raise ValueError("the link is not an image (Content-Type %s)" % (ctype or "missing"))
+    return {"type": "image", "mime": mime, "data": base64.b64encode(data).decode()}
 
 
 async def fetch_remote_images(msgs: list[dict]) -> None:
+    """Download http(s) image links. A link that cannot be used fails the request (400) instead of being left out."""
     for m in msgs:
         for i, p in enumerate(m["parts"]):
             if p["type"] != "image_url":
                 continue
+            where = p.get("where") or "content"
             if not FETCH_IMAGES:
-                m["parts"][i] = {"type": "text", "text": "[image link not fetched: %s]" % p["url"][:200]}
-                continue
+                raise BadContent("image link at %s: this gateway does not download image links (AGY_FETCH_IMAGES=0); "
+                                 "send the image as a base64 data: URI" % where, where)
             try:
                 m["parts"][i] = await asyncio.to_thread(_fetch_image, p["url"])
             except Exception as e:  # noqa: BLE001
-                m["parts"][i] = {"type": "text", "text": "[image could not be downloaded: %s]" % str(e)[:100]}
+                raise BadContent("image link at %s could not be used: %s" % (where, str(e)[:200]), where)
 
 
 # ======================================================================================================
@@ -1302,6 +1435,17 @@ def est_prompt(system: str, blocks: list[dict]) -> int:
 # ======================================================================================================
 
 app = FastAPI(title="ACP-Ant", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
+
+
+@app.exception_handler(BadContent)
+async def _bad_content(request: Request, e: BadContent) -> JSONResponse:
+    """Content the model cannot receive: 400 in the error format of the API that was called (clients and fallback
+    logic recognise it), never a reply written without the content."""
+    log.info("400 unsupported content on %s: %s", request.url.path, str(e)[:200])
+    if request.url.path.startswith("/v1/messages"):
+        return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}}, status_code=400)
+    return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error", "param": e.param or None,
+                                   "code": "unsupported_content"}}, status_code=400)
 
 
 def check_key(request: Request) -> None:

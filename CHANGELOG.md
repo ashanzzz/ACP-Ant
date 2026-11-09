@@ -3,6 +3,13 @@
 网页控制面板会定期读取这个文件（只读取，不上传任何数据）：这里出现比你正在运行的版本更新的版本号时，面板顶部会提示，
 用 `git clone` + `./install.sh` 装的可以在面板里一键更新。格式：`## 版本号 — 日期`，下面每行一条 `- 改动`。
 
+## 1.1.1 — 2026-11-09
+- 修复：请求里带视频、音频、PDF 等文件时（OpenAI `file` / `input_audio` / `video_url`、Responses `input_file`、Anthropic PDF `document` 等），以前网关会悄悄丢掉，模型只看到文字，回答里的内容是编的。现在直接返回 400，写明是第几条消息的第几项，调用方可以换通道。实测 Antigravity 的 ACP 接口本身就不把视频、音频、PDF 交给模型（Gemini 4 Argon、Gemini 3.8 Flash 都一样），所以没法转发过去。
+- 修复：图片链接下载失败、链接其实不是图片、关了图片下载（`AGY_FETCH_IMAGES=0`）时，以前只在提示词里写一句「图片下载不了」照样回答，现在返回 400。
+- 修复：系统提示词里放图片时以前会被丢掉，现在返回 400（OpenAI 本身也不允许）。
+- 新增：纯文本文件（txt、md、json、csv 等）会转成文字发给模型；OpenAI `file` 里装的图片按图片处理；Anthropic 的 `content` 类文档和 `search_result` 也能用了。
+- 新增离线测试 `scripts/content_test.py`（不需要账号和网络）。
+
 ## 1.1.0 — 2026-11-08
 - 新增 Docker 版：`docker compose up -d --build` 一条命令跑起来，账号、密钥、面板密码都存在数据卷里。
 - 新增不用 sudo 的安装方式：`./install.sh --user`，装到 `~/acp-ant`，作为当前用户的服务运行（systemctl --user）。

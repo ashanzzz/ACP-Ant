@@ -37,7 +37,8 @@ Agent / 应用 ──OpenAI 或 Anthropic 接口──▶ ACP-Ant（127.0.0.1:80
 
 - **三种接口**：`/v1/chat/completions`（OpenAI）、`/v1/responses`（OpenAI 新接口，Codex 用这个）、`/v1/messages`（Anthropic），都支持流式输出。
 - **工具调用**：Agent 声明的工具（OpenAI `tools`、Anthropic `tools`、Responses 的 function / custom 工具）会写进提示词交给模型。模型要用工具时，网关把它的回复转成标准的 `tool_calls` / `tool_use` / `function_call` 返回给 Agent。Agent 自己执行工具，再把结果发回来。支持一次调用多个工具，也支持 `tool_choice`。
-- **图片**：data URL、http(s) 图片链接（网关代为下载）、工具结果里的图片都可以。
+- **图片**：data URL、http(s) 图片链接（网关代为下载）、工具结果里的图片都可以。纯文本文件（txt / md / json / csv 等）会转成文字。
+- **视频、音频、PDF 等文件不支持，直接返回 400**：Antigravity 的 ACP 接口只把文字和图片交给模型，视频、音频、PDF 发过去会被它悄悄丢掉，模型照样回答，内容是编的（实测 agy 1.5.3，Gemini 4 Argon / Gemini 3.8 Flash 都一样）。所以网关遇到这类内容（OpenAI `file` / `input_audio` / `video_url`、Responses `input_file`、Anthropic PDF `document` 等）直接返回 400 并写明是哪一项，调用方可以换通道，或者把视频抽成图片帧再发。
 - **每个账号一个独立目录**：`agy` 的 HOME 指向这个目录，登录凭据只存在这里，账号之间互不串。
 - **每个账号一个独立代理**（可选）：`http://`、`https://`、`socks5://`，可带用户名密码。添加时会测出口 IP 和国家，两个账号用了同一个 IP 会提醒。
 - **Antigravity 自己不碰你的机器**：网关给 `agy` 注册的 agent 没有任何内置工具，权限请求一律拒绝。工具只在 Agent 那边执行。
@@ -284,6 +285,7 @@ ACP 协议没有 `temperature`、`max_tokens` 参数，这两个字段会被忽�
 | 登录失效 | 停用这个账号，`account.sh login` 后再 `/admin/reset` | 全部不可用时 503 |
 | 被 Antigravity 审核拦截 | 不换号（换了也一样） | 400 |
 | 模型名不存在（关了兜底时） | 不换号 | 400 |
+| 请求里有视频、音频、PDF 等模型收不到的内容，或图片链接下载不了 | 不发给模型 | 400，写明是第几条消息的第几项 |
 | 所有账号都满了 | 排队，哪个账号先空出来就交给哪个 | 290 秒内没排上：503（Anthropic 格式 529） |
 | 超时 | 默认 290 秒 | 504 |
 
@@ -302,6 +304,7 @@ Anthropic 格式下，「没有可用账号」返回 529（overloaded），Claud
 - `python3 /opt/acp-ant/smoke_test.py [图片路径] [并发数]`：冒烟测试（短回复、系统提示词、读图、并发）。
 - `python3 /opt/acp-ant/agent_test.py [模型名]`：Agent 相关测试（三种接口的工具调用、流式、JSON 模式）。
 - `HOME=/opt/acp-ant/accounts/g1 HTTPS_PROXY=<代理地址> python3 /opt/acp-ant/acp_probe.py --prompt "Reply with OK"`：直接和 `agy acp` 握手，打印协议往来（看账号有哪些模型和思考档位）。
+- 在源码目录里 `/opt/acp-ant/venv/bin/python scripts/content_test.py`：离线测试（不用账号、不联网），检查视频 / 音频 / PDF 等会返回 400、文字和图片照常通过。
 - 日志：`journalctl -u acp-ant -f`；每个账号的 `agy` 日志在 `accounts/<名字>/gw/`。
 
 ## 免责声明
@@ -328,6 +331,8 @@ ACP-Ant turns Google's official **Antigravity CLI (`agy`)** into a standard LLM 
 
 - **Three APIs:** `/v1/chat/completions`, `/v1/responses` (used by Codex CLI) and `/v1/messages`, all with streaming.
 - **Tool calling:** OpenAI `tools`, Anthropic `tools`, and Responses function and custom tools are described to the model. Its requests come back as native `tool_calls` / `tool_use` / `function_call` items. Your agent runs the tools; Antigravity itself has no tools and every permission request is refused.
+- **Images:** data URLs, http(s) image links (downloaded by the gateway) and images inside tool results. Plain-text files (txt / md / json / csv …) are passed as text.
+- **No video, audio or PDF: HTTP 400 instead.** Antigravity's ACP interface hands only text and images to the model. Video, audio and PDF content is silently dropped there, and the model answers anyway with made-up content (measured with agy 1.5.3 on Gemini 4 Argon and Gemini 3.8 Flash). So OpenAI `file` / `input_audio` / `video_url` parts, Responses `input_file`, Anthropic PDF `document` blocks and the like get a 400 that names the offending part, and the caller can fall back to another provider or send video frames as images.
 - **Isolation:** each account has its own HOME directory, so credentials stay separate, and optionally its own HTTP/SOCKS5 proxy.
 - **Load spreading:** requests go to the least busy account, round-robin among equals. Each account runs up to 3 requests at once (`AGY_PER_ACCOUNT`, also settable live in the panel). Extra requests queue, first come first served, for whichever account frees a slot first.
 - **Stream keep-alive:** after 15 silent seconds (`AGY_HEARTBEAT`), a stream sends an SSE comment or an Anthropic `ping` event, so Cloudflare and other proxies don't cut long thinking or long tool calls. Cloudflare cuts a connection after 100 s with no data.
