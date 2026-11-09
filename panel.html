@@ -87,7 +87,6 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
     <div class="field"><button class="primary" style="width:100%" id="loginBtn">登录</button></div>
     <p id="loginErr" class="err small"></p>
   </div>
-  <p class="mute small" style="text-align:center;margin-top:12px">本项目积极参与并认可 <a href="https://linux.do" target="_blank" rel="noopener">LINUX DO 社区</a></p>
 </div>
 
 <div id="appView" style="display:none">
@@ -110,7 +109,7 @@ pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:
     <h2>最近事件</h2>
     <div class="card events" id="events"></div>
     <p class="mute small" style="margin-top:14px">每 10 秒自动刷新。额度每 10 分钟缓存一次，点「刷新额度」立即重读（读取额度不消耗额度）。</p>
-    <p class="mute small">ACP-Ant · 开源项目 · 本项目积极参与并认可 <a href="https://linux.do" target="_blank" rel="noopener">LINUX DO 社区</a></p>
+    <p class="mute small">ACP-Ant · 开源项目</p>
   </main>
 </div>
 
@@ -166,10 +165,7 @@ async function refresh() {
 function render() {
   const s = DATA.server, t = DATA.today;
   $("#srvPill").innerHTML = '<span class="dot ok"></span><span>运行中 · v' + esc(s.version) + " · 已运行 " + esc(ago(s.started).replace("前", "")) + "</span>";
-  const u = DATA.update || {};
-  $("#banner").innerHTML = (s.initial_password ? '<div class="banner">你还在用初始密码。建议点右上角「设置」改成自己的密码（改完服务器上的初始密码文件会自动删除）。</div>' : "") +
-    (u.available ? '<div class="banner">🎉 发现新版本 <b>v' + esc(u.latest) + "</b>（当前 v" + esc(u.current) + '）。 <button class="primary" onclick="updateModal()">查看更新内容' + (u.can_apply ? "并更新" : "") + "</button></div>" : "") +
-    (u.state === "running" || u.state === "restarting" ? '<div class="banner"><span class="spin"></span> 正在更新… <button onclick="updateModal()">查看进度</button></div>' : "");
+  $("#banner").innerHTML = (s.initial_password ? '<div class="banner">你还在用初始密码。建议点右上角「设置」改成自己的密码（改完服务器上的初始密码文件会自动删除）。</div>' : "");
   $("#summary").innerHTML = [
     ["账号", s.usable + " / " + s.accounts, "可用 / 总数"],
     ["今日请求", t.ok + " / " + t.fail, "成功 / 失败"],
