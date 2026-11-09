@@ -922,18 +922,63 @@ def can_apply(info: dict) -> tuple[bool, str]:
 def update_view(with_log: bool = False) -> dict:
     info = install_info()
     ok, why = can_apply(info)
-    latest = UPDATE["latest"]
-    d = {"current": core.__version__, "latest": latest, "available": bool(latest) and _vtuple(latest) > _vtuple(core.__version__),
+    latest = UPDATE["latest"] or core.__version__
+    d = {"current": core.__version__, "latest": latest, "available": False,
          "checked_at": UPDATE["checked_at"], "error": UPDATE["error"], "notes": UPDATE["notes"], "repo": UPDATE_REPO,
          "auto": bool(STATE.get("settings", {}).get("update_check", True)) and UPDATE_HOURS > 0, "every_hours": UPDATE_HOURS,
-         "mode": info.get("mode"), "src": info.get("src") or "", "can_apply": ok, "why": why, "state": UPDATE["state"]}
+         "mode": info.get("mode"), "src": info.get("src") or "", "can_apply": ok, "why": why, "state": "idle"}
     if with_log:
         d["log"] = UPDATE["log"][-6000:]
     return d
 
 
+def _silent_sync_files_sync() -> bool:
+    """后台静默同步远端最新 panel.html 与 README.md（不通知、不中断服务），并检测 git 仓库是否有新提交。"""
+    info = install_info()
+    src = str(info.get("src") or "")
+    for fname in ("panel.html", "README.md"):
+        try:
+            remote_txt = _fetch_text(UPDATE_URL + "/" + fname)
+            if not remote_txt or (fname == "panel.html" and "<!DOCTYPE html>" not in remote_txt):
+                continue
+            targets = [os.path.join(HERE, fname)]
+            if src and os.path.isdir(src):
+                src_f = os.path.join(src, fname)
+                if src_f not in targets:
+                    targets.append(src_f)
+            for tpath in targets:
+                try:
+                    cur_txt = ""
+                    if os.path.isfile(tpath):
+                        with open(tpath, encoding="utf-8") as f:
+                            cur_txt = f.read()
+                    if cur_txt != remote_txt:
+                        tmp = tpath + ".tmp"
+                        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                            f.write(remote_txt)
+                        os.replace(tmp, tpath)
+                except OSError:
+                    pass
+        except Exception:
+            pass
+    if src and os.path.isdir(os.path.join(src, ".git")) and shutil.which("git"):
+        try:
+            env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+            loc = subprocess.run(["git", "-C", src, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10, env=env)
+            rem = subprocess.run(["git", "-C", src, "ls-remote", "origin", f"refs/heads/{UPDATE_BRANCH}"], capture_output=True, text=True, timeout=15, env=env)
+            if loc.returncode == 0 and rem.returncode == 0:
+                l_sha = loc.stdout.strip()
+                r_sha = (rem.stdout.strip().split() or [""])[0]
+                if l_sha and r_sha and l_sha != r_sha:
+                    return True
+        except Exception:
+            pass
+    return False
+
+
 async def check_update() -> dict:
     try:
+        git_has_new = await asyncio.to_thread(_silent_sync_files_sync)
         secs = parse_changelog(await asyncio.to_thread(_fetch_text, UPDATE_URL + "/CHANGELOG.md"))
         if not secs:
             raise ValueError("CHANGELOG.md 里没有版本号")
@@ -941,18 +986,21 @@ async def check_update() -> dict:
         cur = _vtuple(core.__version__)
         newer = sorted([s for s in secs if _vtuple(s["version"]) > cur], key=lambda s: _vtuple(s["version"]), reverse=True)
         UPDATE.update(latest=latest, error="", notes=newer[:10])
-        if _vtuple(latest) > cur and STATE.get("notified_version") != latest:
-            STATE["notified_version"] = latest
-            save_state()
-            core.event("info", "", "发现新版本 %s（当前 %s）：面板顶部可以查看更新内容并更新" % (latest, core.__version__))
-            core.log.warning("a newer ACP-Ant is available: %s (running %s)", latest, core.__version__)
+        if (_vtuple(latest) > cur or git_has_new) and UPDATE["state"] not in ("running", "restarting"):
+            info = install_info()
+            ok, _ = can_apply(info)
+            if ok:
+                UPDATE.update(state="running", log="", started_at=time.time())
+                t = asyncio.create_task(_run_update(str(info["src"]), silent=True))
+                _BG.add(t)
+                t.add_done_callback(_BG.discard)
     except Exception as e:  # noqa: BLE001
         UPDATE["error"] = ("检查失败：%s" % e)[:200]
     UPDATE["checked_at"] = time.time()
     return update_view()
 
 
-async def _run_update(src: str) -> None:
+async def _run_update(src: str, silent: bool = True) -> None:
     env = dict(os.environ, AGY_ROOT=core.ROOT, GIT_TERMINAL_PROMPT="0", LANG="C.UTF-8")
     rc = -1
     try:
@@ -972,18 +1020,19 @@ async def _run_update(src: str) -> None:
     except Exception as e:  # noqa: BLE001
         UPDATE["log"] += "\n%s\n" % e
     if rc != 0:
-        UPDATE["state"] = "failed"
-        core.event("warn", "", "更新失败，网关继续用当前版本 %s（面板里能看到出错信息）" % core.__version__)
+        UPDATE["state"] = "idle" if silent else "failed"
+        if not silent:
+            core.event("warn", "", "更新失败，网关继续用当前版本 %s（面板里能看到出错信息）" % core.__version__)
         return
     UPDATE["state"] = "restarting"
     UPDATE["log"] += "\n==> 文件已更新。等正在处理的请求做完，网关自动重启…\n"
-    core.event("info", "", "新版本文件已就位，网关马上重启")
+    if not silent:
+        core.event("info", "", "新版本文件已就位，网关马上重启")
     for _ in range(180):     # give running requests up to 3 minutes
         if not core.POOL.waiting and not any(a.inflight for a in core.POOL.accounts.values()):
             break
         await asyncio.sleep(1)
     await asyncio.sleep(1)
-    core.log.warning("restarting for the update")
     os.kill(os.getpid(), signal.SIGTERM)       # systemd (Restart=always) starts the new version
 
 
@@ -1009,21 +1058,20 @@ async def api_update_apply(request: Request):
     if UPDATE["state"] in ("running", "restarting"):
         raise HTTPException(409, "正在更新，请稍等")
     UPDATE.update(state="running", log="", started_at=time.time())
-    core.event("info", "", "开始更新（当前 %s）" % core.__version__)
-    t = asyncio.create_task(_run_update(str(info["src"])))
+    t = asyncio.create_task(_run_update(str(info["src"]), silent=True))
     _BG.add(t)
     t.add_done_callback(_BG.discard)
     return update_view(with_log=True)
 
 
 async def update_loop() -> None:
-    if UPDATE_HOURS <= 0:
-        return
-    await asyncio.sleep(60)
+    await asyncio.sleep(5)
     while True:
-        if STATE.get("settings", {}).get("update_check", True):
+        try:
             await check_update()
-        await asyncio.sleep(max(0.25, UPDATE_HOURS) * 3600)
+        except Exception:
+            pass
+        await asyncio.sleep(max(0.25, UPDATE_HOURS or 6.0) * 3600)
 
 
 # ------------------------------------------------------------------------------------------- patrol (keep-alive)
