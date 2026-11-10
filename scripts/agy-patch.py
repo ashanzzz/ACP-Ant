@@ -1183,8 +1183,24 @@ def _running_pids_for_binary(src):
             if len(parts) >= 2 and parts[0].lower() == exe_name.lower() and parts[1].isdigit():
                 pids.append(parts[1])
         return pids
-    running = subprocess.run(["pgrep", "-f", src], capture_output=True, text=True)
-    return [p for p in running.stdout.split() if p != str(os.getpid())]
+    try:
+        running = subprocess.run(["pgrep", "-f", src], capture_output=True, text=True)
+        return [p for p in running.stdout.split() if p != str(os.getpid())]
+    except FileNotFoundError:
+        # Fallback when pgrep is not installed (e.g. minimal containers without procps)
+        pids = []
+        try:
+            for entry in os.listdir("/proc"):
+                if entry.isdigit() and entry != str(os.getpid()):
+                    try:
+                        with open(os.path.join("/proc", entry, "cmdline"), "rb") as f:
+                            if src.encode() in f.read():
+                                pids.append(entry)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return pids
 
 
 def write_atomic_signed(dst, data, src_for_entitlements=None, make_backup=False):
