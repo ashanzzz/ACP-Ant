@@ -60,7 +60,7 @@ from typing import Any, AsyncIterator
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-__version__ = "1.3.0"     # keep in step with the newest heading in CHANGELOG.md (the panel compares against it)
+__version__ = "1.4.0"     # keep in step with the newest heading in CHANGELOG.md (the panel compares against it)
 
 log = logging.getLogger("acp-ant")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -91,7 +91,7 @@ COOLDOWN_QUOTA = _env_int("AGY_COOLDOWN_QUOTA", 30 * 60)       # quota exhausted
 COOLDOWN_RATE = _env_int("AGY_COOLDOWN_RATE", 90)              # rate limited / overloaded
 COOLDOWN_VERIFY = _env_int("AGY_COOLDOWN_VERIFY", 600)         # Google asks the account to verify itself
 KEEP_HOURS = float(os.environ.get("AGY_KEEP_HOURS", "6"))      # delete local conversation files older than this (0 = keep)
-REQUIRE_PROXY = _env_bool("AGY_REQUIRE_PROXY", True)
+REQUIRE_PROXY = _env_bool("AGY_REQUIRE_PROXY", False)   # since 1.4.0 a proxy is optional; set 1 to insist on one per account
 DEFAULT_MODEL = os.environ.get("AGY_DEFAULT_MODEL", "gemini-3.8-flash-medium")
 MODEL_FALLBACK = _env_bool("AGY_MODEL_FALLBACK", True)         # unknown model name -> DEFAULT_MODEL instead of an error
 MAX_IMAGES = _env_int("AGY_MAX_IMAGES", 10)                    # images per request (the most recent ones are kept)

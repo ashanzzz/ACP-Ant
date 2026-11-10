@@ -659,11 +659,11 @@ async def api_create(request: Request):
     else:
         os.makedirs(os.path.join(home, ".gemini"), exist_ok=True)
         os.chmod(home, 0o700)
-        _set_enabled(home, False)
+        _set_enabled(home, False)            # switched off until the login and a check succeed
         ip, cc = "", ""
     for d in ("workspace", ".gemini"):
         os.makedirs(os.path.join(home, d), exist_ok=True)
-    core.event("info", name, "新建账号（代理 %s，出口 %s %s）" % (mask_proxy(proxy) or "无", ip, cc))
+    core.event("info", name, "新建账号（%s）" % (("代理 %s，出口 %s %s" % (mask_proxy(proxy), ip, cc)) if proxy else "不用代理"))
     return {"ok": True, "egress_ip": ip, "country": cc, "same_ip_as": same}
 
 

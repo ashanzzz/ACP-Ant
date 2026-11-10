@@ -161,5 +161,34 @@ gw.REQUIRE_PROXY = True
 r = call("g2", RT)
 check("proxy required and missing -> 400", isinstance(r, HTTPException) and "代理" in r.detail, getattr(r, "detail", r))
 
+gw.REQUIRE_PROXY = False
+
+
+class _Req:
+    def __init__(self, data):
+        self.data = data
+
+
+def create(name, proxy=""):
+    try:
+        return asyncio.run(panel.api_create(_Req({"name": name, "proxy": proxy})))
+    except HTTPException as e:
+        return e
+
+
+r = create("np1")
+check("account without proxy is created", isinstance(r, dict) and r.get("ok") and r.get("egress_ip") == "", r)
+check("no proxy.env written", not os.path.exists(os.path.join(ACC, "np1", "proxy.env")))
+check("new account stays switched off until checked", os.path.exists(os.path.join(ACC, "np1", "disabled")))
+VERDICT[os.path.join(ACC, "np1")] = (True, "gemini-4-argon-high" + chr(10), "np@example.com")
+r = call("np1", RT)
+check("token login works on a no-proxy account", isinstance(r, dict) and r.get("ok"), r)
+r = create("np1")
+check("duplicate name refused", isinstance(r, HTTPException) and r.status_code == 400, r)
+gw.REQUIRE_PROXY = True
+r = create("np2")
+check("AGY_REQUIRE_PROXY=1 still demands a proxy", isinstance(r, HTTPException) and r.status_code == 400, r)
+check("default is proxy optional", not gw._env_bool("AGY_NO_SUCH_VAR_FOR_TEST", False))
+
 print("\n%d/%d passed" % (sum(results), len(results)))
 sys.exit(0 if all(results) else 1)

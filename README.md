@@ -120,7 +120,7 @@ cat data/panel-initial-password.txt     # 面板初始密码（可能要 sudo）
 - **添加账号向导**：填名字和代理 → 自动测出口 IP（同一 IP 被别的账号用过会提醒）→ 点按钮打开 Google 登录页，
   把授权码或落地页网址粘贴回面板 → 自动检测，通过后自动开启。登录全程在你自己的浏览器里完成，面板只转交授权码，不保存。
 - **用 refresh_token 登录**：已经有这个 Google 账号的 refresh_token（例如从 Antigravity 账号管理工具里导出的），
-  在登录这一步展开「已经有 refresh_token？」直接粘贴（单独的 token，或者含 `refresh_token` 的整段 JSON 都行），不用再开浏览器。
+  在「添加账号」里切到 Refresh Token 标签页直接粘贴（单独的 token，或者含 `refresh_token` 的整段 JSON 都行），不用再开浏览器。
   见下文「用 refresh_token 添加账号」。
 - **接入信息**：接口地址、一键复制密钥、全部模型名、Codex / PI-Desktop / curl 配置示例。**在线测试**：选模型发一句话。**最近事件**：换号、出错、开关等记录。
 - **版本更新**：顶部提示新版本和更新内容；`git clone` 安装的点「立即更新」自动拉取、安装、重启（见上文「更新」）。
@@ -156,13 +156,13 @@ cat data/panel-initial-password.txt     # 面板初始密码（可能要 sudo）
 | `account.sh proxy g1` | 换代理节点 |
 | `account.sh remove g1` | 删除账号（含登录凭据，会先确认） |
 
-不想用代理：`AGY_REQUIRE_PROXY=0 /opt/acp-ant/account.sh add g1`，同时在 `gateway.env` 里加一行 `AGY_REQUIRE_PROXY=0`。
+代理是可选的（1.4.0 起）：面板里留空、`account.sh add` 时直接回车都行，那个账号就用服务器本机网络。想强制每个账号都有代理，在 `gateway.env` 里写 `AGY_REQUIRE_PROXY=1`（`account.sh` 的环境变量也要设成一样）。
 
 ### 用 refresh_token 添加账号
 
 已经有某个 Google 账号的 refresh_token 时，可以不走浏览器登录：
 
-- 面板：添加账号（或点「重新登录」）→ 登录这一步展开「已经有 refresh_token？」→ 粘贴 → 「用 refresh_token 登录」。
+- 面板：添加账号 → 切到「Refresh Token」标签页 → 填名字（代理可选）→ 粘贴 → 「确认添加」；已有账号点「重新登录」也是同样两个标签页。
 - 命令行：`/opt/acp-ant/account.sh token g1`，粘贴后回车（屏幕上不显示）。
 
 要求和做法：

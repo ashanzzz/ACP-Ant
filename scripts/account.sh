@@ -9,13 +9,13 @@
 #   account.sh remove <名字>   删除账号目录（会先确认）
 # 账号目录 $AGY_ROOT/accounts/<名字>：HOME 指向这里，登录凭据只存在这里（不用系统钥匙串，账号之间互不串）。
 # 代理写在 <名字>/proxy.env（权限 600），只给这个账号的 agy 用；支持 http://、https://、socks5://（可带 用户:密码@）。
-# 不想用代理：AGY_REQUIRE_PROXY=0 account.sh add <名字>（网关也要设同样的环境变量）。
+# 代理是可选的（1.4.0 起默认不强制）；想强制每个账号都有代理：AGY_REQUIRE_PROXY=1（网关也要设同样的环境变量）。
 set -euo pipefail
 shopt -s nullglob
 ROOT=${AGY_ROOT:-/opt/acp-ant}
 AGY=${AGY_BIN:-$ROOT/bin/agy}
 ACC=${AGY_ACCOUNTS:-$ROOT/accounts}
-REQUIRE_PROXY=${AGY_REQUIRE_PROXY:-1}
+REQUIRE_PROXY=${AGY_REQUIRE_PROXY:-0}
 ME=$(basename "$0")
 
 die() { echo "错误：$*" >&2; exit 1; }
@@ -52,7 +52,11 @@ set_proxy() {
   echo "请输入账号 $name 的代理节点地址（输入时不显示），格式例如："
   echo "  http://用户名:密码@1.2.3.4:8080   或   socks5://用户名:密码@1.2.3.4:1080"
   echo "（粘贴后屏幕上看不到字是正常的，直接按回车）"
-  read -rs -p "代理地址：" p; echo
+  read -rs -p "代理地址（可选，直接回车 = 不用代理）：" p; echo
+  if [ -z "$p" ]; then
+    if no_proxy_ok; then echo "不用代理，这个账号走服务器本机网络。"; return 0; fi
+    die "这台网关要求每个账号都有代理（AGY_REQUIRE_PROXY=1）"
+  fi
   [[ "$p" =~ ^(https?|socks5h?)://[^[:space:]]+:[0-9]{2,5}/?$ ]] || die "格式不对，需要 协议://[用户:密码@]主机:端口"
   echo "正在通过这个代理测出口 IP…"
   ip=$(curl -s --max-time 20 -x "$p" https://api.ipify.org || true)
@@ -138,10 +142,8 @@ case "$cmd" in
     mkdir -p "$d/workspace" && chmod 700 "$d"
     if [ -f "$d/proxy.env" ]; then
       echo "账号 $name 已经设置过代理 $(mask "$(proxy_of "$name")")（要换代理：$ME proxy $name）"
-    elif no_proxy_ok; then
-      echo "账号 $name 不用代理（AGY_REQUIRE_PROXY=0）"
     else
-      echo "【第 1 步 / 共 2 步】设置账号 $name 的代理节点"
+      echo "【第 1 步 / 共 2 步】设置账号 $name 的代理节点（可选）"
       set_proxy "$name"
     fi
     if logged_in "$name"; then
@@ -175,8 +177,8 @@ case "$cmd" in
   token)
     need_name "$name"; d=$ACC/$name
     mkdir -p "$d/workspace" && chmod 700 "$d"
-    if [ ! -f "$d/proxy.env" ] && ! no_proxy_ok; then
-      echo "【第 1 步 / 共 2 步】设置账号 $name 的代理节点"; set_proxy "$name"; echo; echo "【第 2 步 / 共 2 步】用 refresh_token 登录"
+    if [ ! -f "$d/proxy.env" ]; then
+      echo "【第 1 步 / 共 2 步】设置账号 $name 的代理节点（可选，直接回车 = 不用代理）"; set_proxy "$name"; echo; echo "【第 2 步 / 共 2 步】用 refresh_token 登录"
     fi
     do_token "$name" ;;
   proxy) need_name "$name"; [ -d "$ACC/$name" ] || die "没有账号 $name"; set_proxy "$name" ;;

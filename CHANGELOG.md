@@ -3,6 +3,11 @@
 网页控制面板会定期读取这个文件（只读取，不上传任何数据）：这里出现比你正在运行的版本更新的版本号时，面板顶部会提示，
 用 `git clone` + `./install.sh` 装的可以在面板里一键更新。格式：`## 版本号 — 日期`，下面每行一条 `- 改动`。
 
+## 1.4.0 — 2026-11-10
+- 改版「添加账号」：点「添加账号」后是 OAuth 授权 / Refresh Token 两个标签页。Refresh Token 页直接粘贴（单个 `1//...`、含 `refresh_token` 的 JSON 如 `{email, refresh_token}`，或任意含 token 的文本），点「确认添加」一步完成建号和登录；token 不能用时自动删掉刚建的空账号。「重新登录」也是同样两个标签页。
+- 代理改为可选：面板里留空、`account.sh` 里直接回车都行，那个账号用服务器本机网络。默认不再强制代理（`AGY_REQUIRE_PROXY` 默认值由 1 改为 0）；想强制每个账号都有代理，设 `AGY_REQUIRE_PROXY=1`。
+- 测试 `scripts/token_login_test.py` 增加无代理建号等检查（39 项）。
+
 ## 1.3.0 — 2026-11-10
 - 新增「用 refresh_token 登录」：已经有某个 Google 账号的 refresh_token 时，不用再开浏览器登录。面板里在登录这一步展开「已经有 refresh_token？」粘贴即可（单独的 token 或含 `refresh_token` 的整段 JSON 都行）；命令行是 `account.sh token <名字>`（不回显，账号没有就先建、先设代理）。
 - 只能用 Antigravity 登录得到的 refresh_token（Antigravity 编辑器、Antigravity 账号管理工具导出的），Gemini CLI 等其它程序的不能用。网关把它写进官方 `agy` 自己的登录文件（权限 600，和浏览器登录后同一格式），由 `agy` 通过这个账号的代理去换令牌；网关里没有 Google 客户端密钥。
