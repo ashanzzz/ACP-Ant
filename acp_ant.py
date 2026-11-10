@@ -41,9 +41,9 @@ import asyncio
 import base64
 import json
 try:
-    from jsonrepair import jsonrepair
+    from json_repair import repair_json
 except ImportError:
-    jsonrepair = None
+    repair_json = None
 import logging
 import os
 import re
@@ -1622,9 +1622,9 @@ def _loads_lenient(s: str) -> Any:
                 return json.loads(s[i:j + 1], strict=False)
             except Exception:
                 continue
-    if jsonrepair is not None:
+    if repair_json is not None:
         try:
-            return json.loads(jsonrepair(s), strict=False)
+            return json.loads(repair_json(s), strict=False)
         except Exception:
             pass
     return None
@@ -1686,9 +1686,9 @@ def parse_tool_calls(text: str) -> tuple[str, list[dict] | None]:
             try:
                 args = json.loads(args, strict=False) if args.strip() else {}
             except ValueError:
-                if jsonrepair is not None:
+                if repair_json is not None:
                     try:
-                        args = json.loads(jsonrepair(args), strict=False)
+                        args = json.loads(repair_json(args), strict=False)
                     except Exception:
                         pass
         if name:
