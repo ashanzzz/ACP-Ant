@@ -206,12 +206,13 @@ _BLOCK_TEXT = re.compile(r"^\s*The prompt could not be submitted|Generative AI P
 #   "⚠ API error (attempt 1): RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota)."
 #   ... "⚠ Agent execution terminated due to error."
 _APIERR_TEXT = re.compile(r"^\s*⚠\s*(?:API error \(attempt \d+\):\s*([^\n]+)\n|Agent execution terminated due to error)")
+_NETWORK_TEXT = re.compile(r"^\s*⚠?\s*There was a network issue connecting to the server", re.I)
 
 
 # Every canned reply above starts with one of these. As soon as the answer clearly starts with something else it is
 # streamed out right away instead of being held back (first token arrives with the model's first chunk).
 _CANNED_STARTS = ("⚠", "the prompt could not be submitted", "your prompt contains sensitive words", "prompt contains sensitive words",
-                  "verification required", "verify your account")
+                  "verification required", "verify your account", "there was a network issue")
 
 
 def could_be_canned(text: str) -> bool:
@@ -226,6 +227,8 @@ def soft_error(text: str) -> AcpError | None:
         return AcpError("blocked by Antigravity's prompt filter: " + head[:200], "BLOCKED")
     if _VERIFY_TEXT.search(head):
         return AcpError("account must be verified with Google: " + head[:120].strip(), "VERIFY")
+    if _NETWORK_TEXT.search(head):
+        return AcpError("Antigravity upstream network issue: " + head[:120].strip(), "RATE_LIMIT")
     m = _APIERR_TEXT.search(head)
     if m:
         msg = (m.group(1) or "agent execution terminated").strip()
@@ -254,7 +257,7 @@ def classify(message: str) -> str:
         return "QUOTA"
     if re.search(r"rate.?limit|429|too many requests|overloaded|capacity|unavailable|503", m):
         return "RATE_LIMIT"
-    if re.search(r"timeout|timed out|deadline", m):
+    if re.search(r"timeout|timed out|deadline|network issue|connection reset|handshake", m):
         return "TIMEOUT"
     if re.search(r"safety|blocked|prohibited|recitation", m):
         return "BLOCKED"
