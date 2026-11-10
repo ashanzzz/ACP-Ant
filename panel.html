@@ -307,7 +307,22 @@ function loginModal(name, wizard) {
     '<p>点「开始登录」后会出现一个 Google 登录按钮。</p><ol class="small"><li>点按钮在浏览器里打开 Google 页面，选这个账号要用的 Google 账号，同意授权。</li>' +
     '<li>授权后浏览器会跳到一个<b>打不开的网址</b>（以 localhost 开头），或者页面上显示一串<b>授权码</b>。</li><li>把浏览器地址栏里的<b>整串网址</b>（或那串授权码）复制下来，粘贴到下面的框里，点「完成登录」。</li></ol>' +
     '<div id="lgArea"><button class="primary" id="lgStart">开始登录</button></div><p id="lgRes" class="small"></p>' +
+    '<details style="margin-top:12px"><summary class="small">已经有这个 Google 账号的 refresh_token？直接粘贴登录</summary>' +
+    '<div class="field"><label>refresh_token（以 1// 开头；也可以粘贴含 refresh_token 的整段 JSON；输入时不显示）</label><input id="rtVal" type="password" autocomplete="off" spellcheck="false"></div>' +
+    '<label class="small mute"><input type="checkbox" style="width:auto" onchange="rtVal.type=this.checked?\'text\':\'password\'"> 显示</label>' +
+    '<p class="small mute">只能用 Antigravity 登录得到的 refresh_token（例如从 Antigravity 账号管理工具里导出的），Gemini CLI 等其它程序的不能用。' +
+    '网关把它写进这个账号目录里的登录文件（权限 600），不显示、不记日志；不能用时原来的登录不变。</p>' +
+    '<p><button class="primary" id="rtGo">用 refresh_token 登录</button></p><p id="rtRes" class="small"></p></details>' +
     '<div class="foot"><button id="lgCancel">' + (wizard ? "以后再登录" : "取消") + "</button></div>");
+  $("#rtGo").onclick = async e => {
+    try { const r = await busy(e.target, () => api("/accounts/" + name + "/login/token", {body: {refresh_token: $("#rtVal").value}}));
+      $("#rtVal").value = "";
+      let msg = name + " 登录成功" + (r.email ? "（" + r.email + "）" : "");
+      if (r.same_email_as.length) msg += "；提醒：账号 " + r.same_email_as.join("、") + " 登录的也是这个 Google 账号";
+      toast(msg, r.same_email_as.length ? "bad" : "ok");
+      if (wizard) checkStep(name); else { delete $("#modal").dataset.sticky; closeModal(); refresh(); } }
+    catch (err) { $("#rtRes").innerHTML = '<span class="err">' + esc(err.message) + "</span>"; }
+  };
   $("#lgCancel").onclick = async () => { api("/accounts/" + name + "/login/cancel", {body: {}}).catch(() => {}); delete $("#modal").dataset.sticky; closeModal(); refresh(); };
   $("#lgStart").onclick = async e => {
     try { const r = await busy(e.target, () => api("/accounts/" + name + "/login/start", {body: {}}));

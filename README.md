@@ -119,6 +119,9 @@ cat data/panel-initial-password.txt     # 面板初始密码（可能要 sudo）
 - **按钮**：检测（真发一句话；Google 要求验证时直接给出验证链接）、刷新额度、重新登录、换代理、清除冷却、删除。
 - **添加账号向导**：填名字和代理 → 自动测出口 IP（同一 IP 被别的账号用过会提醒）→ 点按钮打开 Google 登录页，
   把授权码或落地页网址粘贴回面板 → 自动检测，通过后自动开启。登录全程在你自己的浏览器里完成，面板只转交授权码，不保存。
+- **用 refresh_token 登录**：已经有这个 Google 账号的 refresh_token（例如从 Antigravity 账号管理工具里导出的），
+  在登录这一步展开「已经有 refresh_token？」直接粘贴（单独的 token，或者含 `refresh_token` 的整段 JSON 都行），不用再开浏览器。
+  见下文「用 refresh_token 添加账号」。
 - **接入信息**：接口地址、一键复制密钥、全部模型名、Codex / PI-Desktop / curl 配置示例。**在线测试**：选模型发一句话。**最近事件**：换号、出错、开关等记录。
 - **版本更新**：顶部提示新版本和更新内容；`git clone` 安装的点「立即更新」自动拉取、安装、重启（见上文「更新」）。
 - **同时请求数**：首页显示「正在处理 / 同时上限」和排队数；在「设置」里改每个账号同时处理几个（1–10，默认 3），保存后立即生效。
@@ -149,10 +152,28 @@ cat data/panel-initial-password.txt     # 面板初始密码（可能要 sudo）
 | `account.sh list` | 列出所有账号、代理（只显示主机和端口）、出口 IP、登录状态和可用模型 |
 | `account.sh check g1` | 真发一句话测试；如果 Google 要求验证这个账号，会打印验证网址 |
 | `account.sh login g1` | 重新登录（代理不变） |
+| `account.sh token g1` | 用 refresh_token 登录（输入时不显示；账号还没有就先建、先设代理） |
 | `account.sh proxy g1` | 换代理节点 |
 | `account.sh remove g1` | 删除账号（含登录凭据，会先确认） |
 
 不想用代理：`AGY_REQUIRE_PROXY=0 /opt/acp-ant/account.sh add g1`，同时在 `gateway.env` 里加一行 `AGY_REQUIRE_PROXY=0`。
+
+### 用 refresh_token 添加账号
+
+已经有某个 Google 账号的 refresh_token 时，可以不走浏览器登录：
+
+- 面板：添加账号（或点「重新登录」）→ 登录这一步展开「已经有 refresh_token？」→ 粘贴 → 「用 refresh_token 登录」。
+- 命令行：`/opt/acp-ant/account.sh token g1`，粘贴后回车（屏幕上不显示）。
+
+要求和做法：
+
+- **只能用 Antigravity 登录得到的 refresh_token**（Antigravity 编辑器、各种 Antigravity 账号管理工具导出的都是），一般以 `1//` 开头。
+  Google 的 refresh_token 和签发它的程序绑定，Gemini CLI 等其它程序的 refresh_token 在这里用不了。
+- 网关把它写进这个账号目录里官方 `agy` 自己的登录文件（`accounts/<名字>/.gemini/antigravity-cli/antigravity-oauth-token`，权限 600），
+  格式和浏览器登录后的一样，然后让 `agy` 自己去换新的访问令牌、读出账号邮箱。网关里没有 Google 的客户端密钥，也不直接请求 Google。
+- 写完马上检测：用不了（失效、被撤销、不是 Antigravity 的、代理连不上）就恢复原来的登录文件，账号不受影响。
+- refresh_token 不显示、不记日志、不返回给面板；登录成功只显示账号邮箱。同一个 Google 账号已经被别的账号用了会提醒。
+- 用 refresh_token 登录时一样走这个账号自己的代理。一个 refresh_token 等于这个 Google 账号的长期登录，请当密码保管。
 
 ## 接入 Agent 和应用
 
@@ -316,7 +337,8 @@ Anthropic 格式下，「没有可用账号」返回 529（overloaded），Claud
 ## 安全与隐私
 
 - 网关默认只监听 `127.0.0.1`，所有接口（除了 `/healthz`）都要密钥。
-- Google 登录凭据由官方 `agy` 自己保存在每个账号的目录里，网关不读、不存、不打印。
+- Google 登录凭据由官方 `agy` 自己保存在每个账号的目录里，网关不使用、不打印（面板只从里面读出账号邮箱）。
+  唯一的例外是你用 refresh_token 登录时：网关把它写进这个账号的登录文件一次（权限 600），不记日志、不返回。
 - 代理地址（含密码）存在 `accounts/<名字>/proxy.env`，权限 600；`list` 只显示主机和端口。
 - `accounts/`、`gateway.env` 已写进 `.gitignore`，**不要把它们传到任何地方**。
 - 网关启动 `agy` 时加了 `--disable-telemetry`，关闭它的遥测。
@@ -357,6 +379,7 @@ ACP-Ant turns Google's official **Antigravity CLI (`agy`)** into a standard LLM 
 - **Images:** data URLs, http(s) image links (downloaded by the gateway) and images inside tool results. Plain-text files (txt / md / json / csv …) are passed as text.
 - **No video, audio or PDF by default: HTTP 400 instead** (see video mode below). Antigravity's ACP interface hands only text and images to the model. Video, audio and PDF content is silently dropped there, and the model answers anyway with made-up content (measured with agy 1.5.3 on Gemini 4 Argon and Gemini 3.8 Flash). So OpenAI `file` / `input_audio` / `video_url` parts, Responses `input_file`, Anthropic PDF `document` blocks and the like get a 400 that names the offending part, and the caller can fall back to another provider or send video frames as images.
 - **Video mode (experimental, off by default, `AGY_VIDEO_MODE=1`):** lets Gemini models watch video, hear audio and read PDFs sent inline as base64 (no link downloads; 40 MB per file and 5 files per request by default). Antigravity's ACP interface accepts no video, so the only way is to put the file on the server and let the model open it with its own `read_file` tool. ACP-Ant guards that in three layers. (1) Such requests run in a second `agy` process per account that has `read_file` as its only tool, with a dedicated HOME (no `proxy.env`, no logs; the proxy comes through the environment), a private temp directory and an empty working directory. agy 1.5.3 reads without permission only inside the session's working directory and the temp directory; everything else raises a permission request, which the gateway refuses. (2) The gateway checks every `read_file` call: a path that is not an attachment of this request cancels the request with a 400, and nothing the model writes afterwards reaches the caller. (3) Attachments live in a per-request directory with a random 128-bit name and are deleted when the request ends, together with agy's own copies. Tested with canary files in the account directory, logs, HOME, temp directory, another request's directory, `/tmp`, `/var/tmp` and the home directory: none leaked, also with an agent deliberately told to open anything (20 of 20 out-of-bounds reads stopped). This relies on agy's permission system plus the gateway's check, not on OS-level isolation; rerun the tests after upgrading agy.
+- **Log in with a refresh_token (1.3.0):** in the panel's login step ("已经有 refresh_token？") or with `account.sh token <name>`. Only refresh tokens issued to Antigravity work (Antigravity editor, Antigravity account managers; usually starting with `1//`); Google binds a refresh token to the app that obtained it, so Gemini CLI tokens are refused. The token is written once into `agy`'s own login file in that account's directory (mode 600, same format as after a browser login) and `agy` exchanges it itself through the account's proxy; the gateway holds no Google client secret and never logs or returns the token. If the token does not work, the previous login file is put back.
 - **Isolation:** each account has its own HOME directory, so credentials stay separate, and optionally its own HTTP/SOCKS5 proxy.
 - **Load spreading:** requests go to the least busy account, round-robin among equals. Each account runs up to 3 requests at once (`AGY_PER_ACCOUNT`, also settable live in the panel). Extra requests queue, first come first served, for whichever account frees a slot first.
 - **Stream keep-alive:** after 15 silent seconds (`AGY_HEARTBEAT`), a stream sends an SSE comment or an Anthropic `ping` event, so Cloudflare and other proxies don't cut long thinking or long tool calls. Cloudflare cuts a connection after 100 s with no data.
@@ -365,7 +388,7 @@ ACP-Ant turns Google's official **Antigravity CLI (`agy`)** into a standard LLM 
 - **Unknown model names** fall back to the default model, which can be turned off.
 - **Cleanup:** local conversation files older than 6 hours are deleted every hour.
 - **Web panel** at `/`, protected by an admin password (initial one in `panel-initial-password.txt`). From the panel you can:
-  - add accounts: test the proxy, then log in with Google through a paste box;
+  - add accounts: test the proxy, then log in with Google through a paste box, or paste the account's refresh_token instead;
   - re-login, change proxy, health-check, clear cooldowns, delete;
   - see per-account quota (weekly and 5-hour windows with reset times) and request / token stats;
   - turn each account on or off;
@@ -390,6 +413,7 @@ If `python3-venv` is missing, the installer adds it when apt and sudo are availa
 ```bash
 git clone https://github.com/czg86389-hub/ACP-Ant.git && cd ACP-Ant && ./install.sh
 /opt/acp-ant/account.sh add g1      # enter the proxy (hidden input), then log in with Google
+/opt/acp-ant/account.sh token g2    # or: log in with a refresh_token (hidden input)
 # Codex: model_provider "acpant", base_url "http://127.0.0.1:8095/v1", wire_api "responses", env_key "ACPANT_KEY"
 ```
 

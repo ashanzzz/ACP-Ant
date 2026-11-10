@@ -33,7 +33,9 @@ a second, sandboxed agy process per account whose agent has a single tool, read_
 The idea of driving `agy acp` from another program comes from lili-luo/dsh-plugin-bundle
 (dsh-llm-antigravity-acp, MIT). This file is an independent implementation.
 
-The gateway never reads or stores Google credentials: `agy` keeps them inside each account's HOME.
+Google credentials live inside each account's HOME, where `agy` keeps them. The gateway does not use them (the panel
+only reads the account's e-mail address from the login file); it writes one only when the owner logs an account in
+with a refresh_token in the panel: written once to that account's login file, never logged or sent back.
 """
 from __future__ import annotations
 
@@ -58,7 +60,7 @@ from typing import Any, AsyncIterator
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-__version__ = "1.2.0"     # keep in step with the newest heading in CHANGELOG.md (the panel compares against it)
+__version__ = "1.3.0"     # keep in step with the newest heading in CHANGELOG.md (the panel compares against it)
 
 log = logging.getLogger("acp-ant")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
