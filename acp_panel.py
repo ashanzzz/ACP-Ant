@@ -44,7 +44,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HTML_FILE = os.path.join(HERE, "panel.html")
 COOKIE = "acpant_panel"
 SESSION_SECONDS = 7 * 24 * 3600
-NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
+NAME_RE = re.compile(r"^[a-zA-Z0-9_@+][a-zA-Z0-9_.@+-]{0,63}$")   # e-mail addresses are fine as account names
 PROXY_RE = re.compile(r"^(https?|socks5h?)://\S+:[0-9]{2,5}/?$")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\r")
 DEFAULT_SETTINGS = {"auto_check": True, "check_hours": 6, "prompt_check": False, "update_check": True}
@@ -290,8 +290,8 @@ def get_account(name: str):
 
 
 def home_of(name: str) -> str:
-    if not NAME_RE.match(name or ""):
-        raise HTTPException(400, "名字只能用字母、数字、- 和 _（最长 32 个字符）")
+    if not NAME_RE.match(name or "") or ".." in name:
+        raise HTTPException(400, "名字只能用字母、数字和 - _ . @ +（最长 64 个字符），可以直接用 Google 邮箱")
     return os.path.join(core.ACCOUNTS_DIR, name)
 
 
@@ -472,6 +472,76 @@ def drop_login(name: str) -> None:
         s.close()
 
 
+# ------------------------------------------------------------------------------------------- login with a refresh_token
+
+TOKEN_FILE = os.path.join(".gemini", "antigravity-cli", "antigravity-oauth-token")   # where `agy` keeps its login
+RT_RE = re.compile(r"1//[0-9A-Za-z_\-]{20,500}")
+TOKEN_LOCK = asyncio.Lock()
+
+
+def token_path(home: str) -> str:
+    return os.path.join(home, TOKEN_FILE)
+
+
+def _find_key(obj: Any, keys: tuple[str, ...], depth: int = 0) -> list[str]:
+    if depth > 6:
+        return []
+    if isinstance(obj, dict):
+        out = [v for k, v in obj.items() if k in keys and isinstance(v, str)]
+        for v in obj.values():
+            out += _find_key(v, keys, depth + 1)
+        return out
+    if isinstance(obj, list):
+        return [x for v in obj[:200] for x in _find_key(v, keys, depth + 1)]
+    return []
+
+
+def parse_refresh_token(text: str) -> tuple[str, str]:
+    """The owner may paste the bare token, a JSON blob that contains it (an Antigravity token file, an account-manager
+    export) or a line like refresh_token=... Returns (token, "") or ("", reason)."""
+    text = (text or "").strip()
+    if not text:
+        return "", "请粘贴 refresh_token"
+    if len(text) > 50000:
+        return "", "内容太长了，只粘贴一个账号的 refresh_token"
+    try:
+        found = [t.strip() for t in _find_key(json.loads(text), ("refresh_token", "refreshToken"))]
+    except ValueError:
+        found = []
+    found = [t for t in found if RT_RE.fullmatch(t)] or RT_RE.findall(text)
+    uniq = list(dict.fromkeys(found))
+    if not uniq:
+        return "", "这看起来不是 Google 的 refresh_token（一般以 1// 开头，只含字母、数字、- 和 _）"
+    if len(uniq) > 1:
+        return "", "里面有 %d 个不同的 refresh_token，一次只能给一个账号登录" % len(uniq)
+    return uniq[0], ""
+
+
+def token_body(rt: str) -> str:
+    """Same shape `agy` writes after a browser login. The empty, long-expired access token makes `agy` exchange the
+    refresh token right away; it then fills in the access token and the account's e-mail itself."""
+    return json.dumps({"token": {"access_token": "", "token_type": "Bearer", "refresh_token": rt,
+                                 "expiry": "2000-01-01T00:00:00Z"}, "auth_method": "consumer"})
+
+
+def token_email(home: str) -> str:
+    try:
+        with open(token_path(home)) as f:
+            return str(json.load(f).get("id_token_email") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def accounts_with_email(email: str, skip: str) -> list[str]:
+    if not email:
+        return []
+    try:
+        names = sorted(os.listdir(core.ACCOUNTS_DIR))
+    except OSError:
+        return []
+    return [n for n in names if n != skip and token_email(os.path.join(core.ACCOUNTS_DIR, n)).lower() == email.lower()]
+
+
 # ------------------------------------------------------------------------------------------- overview
 
 def status_of(acc) -> tuple[str, str]:
@@ -589,11 +659,11 @@ async def api_create(request: Request):
     else:
         os.makedirs(os.path.join(home, ".gemini"), exist_ok=True)
         os.chmod(home, 0o700)
-        _set_enabled(home, False)
+        _set_enabled(home, False)            # switched off until the login and a check succeed
         ip, cc = "", ""
     for d in ("workspace", ".gemini"):
         os.makedirs(os.path.join(home, d), exist_ok=True)
-    core.event("info", name, "新建账号（代理 %s，出口 %s %s）" % (mask_proxy(proxy) or "无", ip, cc))
+    core.event("info", name, "新建账号（%s）" % (("代理 %s，出口 %s %s" % (mask_proxy(proxy), ip, cc)) if proxy else "不用代理"))
     return {"ok": True, "egress_ip": ip, "country": cc, "same_ip_as": same}
 
 
@@ -720,6 +790,58 @@ async def api_login_finish(name: str, request: Request):
     msg = re.sub(r"\s+", " ", out).strip()[-300:]
     core.event("warn", name, "Google 登录没有成功")
     raise HTTPException(400, "登录没有成功：" + (msg or "请确认粘贴的是完整的网址或授权码，然后重新开始登录"))
+
+
+@router.post("/panel/api/accounts/{name}/login/token")
+async def api_login_token(name: str, request: Request):
+    """Log an account in with a Google refresh_token instead of the browser flow. The token goes straight into the
+    account's own login file (mode 600) and is never logged or sent back; `agy models` then proves it works. If it
+    does not, the previous login file is put back."""
+    require(request, True)
+    home = home_of(name)
+    if not os.path.isdir(home):
+        raise HTTPException(404, "没有这个账号：%s" % name)
+    if core.REQUIRE_PROXY and not os.path.exists(os.path.join(home, "proxy.env")):
+        raise HTTPException(400, "先给这个账号设置代理再登录")
+    rt, why = parse_refresh_token(str((await body_of(request)).get("refresh_token") or ""))
+    if not rt:
+        raise HTTPException(400, why)
+    async with TOKEN_LOCK:
+        drop_login(name)
+        core.POOL.scan()
+        acc = core.POOL.accounts.get(name)
+        if acc:
+            await acc.stop_processes()      # a running agy could write its old token back over the new one
+        path = token_path(home)
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        try:
+            with open(path, "rb") as f:
+                old: bytes | None = f.read()
+        except OSError:
+            old = None
+        _write_private(path, token_body(rt))
+        ok, out = await logged_in(home)
+        if not ok:
+            if old is None:
+                os.remove(path)
+            else:
+                fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(old)
+                os.replace(path + ".tmp", path)
+            if acc and acc.acp and acc.enabled:
+                asyncio.create_task(acc.acp.prewarm())
+            core.event("warn", name, "用 refresh_token 登录没有成功")
+            if "sign in" in out.lower():
+                raise HTTPException(400, "这个 refresh_token 用不了：可能已经失效或被撤销，或者不是 Antigravity 登录得到的"
+                                         "（Gemini CLI 等其它程序的 refresh_token 不能用）。原来的登录没有改动。")
+            raise HTTPException(400, "检测没有通过（可能是代理连不上），原来的登录没有改动：" + re.sub(r"\s+", " ", out).strip()[-200:])
+    email = token_email(home)
+    if acc:
+        await restart_acp(acc)
+        acc.quota, acc.verify_url = None, ""
+    core.event("info", name, "用 refresh_token 登录成功" + ("（%s）" % email if email else ""))
+    return {"ok": True, "email": email, "same_email_as": accounts_with_email(email, name)}
 
 
 @router.post("/panel/api/accounts/{name}/login/cancel")

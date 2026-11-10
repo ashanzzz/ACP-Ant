@@ -33,7 +33,9 @@ a second, sandboxed agy process per account whose agent has a single tool, read_
 The idea of driving `agy acp` from another program comes from lili-luo/dsh-plugin-bundle
 (dsh-llm-antigravity-acp, MIT). This file is an independent implementation.
 
-The gateway never reads or stores Google credentials: `agy` keeps them inside each account's HOME.
+Google credentials live inside each account's HOME, where `agy` keeps them. The gateway does not use them (the panel
+only reads the account's e-mail address from the login file); it writes one only when the owner logs an account in
+with a refresh_token in the panel: written once to that account's login file, never logged or sent back.
 """
 from __future__ import annotations
 
@@ -62,7 +64,7 @@ from typing import Any, AsyncIterator
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-__version__ = "1.2.0"     # keep in step with the newest heading in CHANGELOG.md (the panel compares against it)
+__version__ = "1.4.1"     # keep in step with the newest heading in CHANGELOG.md (the panel compares against it)
 
 log = logging.getLogger("acp-ant")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -93,7 +95,7 @@ COOLDOWN_QUOTA = _env_int("AGY_COOLDOWN_QUOTA", 30 * 60)       # quota exhausted
 COOLDOWN_RATE = _env_int("AGY_COOLDOWN_RATE", 90)              # rate limited / overloaded
 COOLDOWN_VERIFY = _env_int("AGY_COOLDOWN_VERIFY", 600)         # Google asks the account to verify itself
 KEEP_HOURS = float(os.environ.get("AGY_KEEP_HOURS", "6"))      # delete local conversation files older than this (0 = keep)
-REQUIRE_PROXY = _env_bool("AGY_REQUIRE_PROXY", True)
+REQUIRE_PROXY = _env_bool("AGY_REQUIRE_PROXY", False)   # since 1.4.0 a proxy is optional; set 1 to insist on one per account
 DEFAULT_MODEL = os.environ.get("AGY_DEFAULT_MODEL", "gemini-3.8-flash-medium")
 MODEL_FALLBACK = _env_bool("AGY_MODEL_FALLBACK", True)         # unknown model name -> DEFAULT_MODEL instead of an error
 MAX_IMAGES = _env_int("AGY_MAX_IMAGES", 10)                    # images per request (the most recent ones are kept)

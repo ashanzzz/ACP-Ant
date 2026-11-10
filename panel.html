@@ -61,6 +61,9 @@ h2{font-size:15px;margin:22px 0 10px}
 .modal .foot{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
 .field{margin-top:10px}
 .field label{display:block;font-size:13px;color:var(--mute);margin-bottom:4px}
+.tabs{display:flex;gap:6px;padding:4px;background:var(--bg);border:1px solid var(--line);border-radius:10px;margin-bottom:8px}
+.tabs button{flex:1;border:0;background:transparent;color:var(--mute);padding:8px;border-radius:8px}
+.tabs button.on{background:var(--panel2);color:var(--acc)}
 .steps{display:flex;gap:6px;margin-bottom:12px}
 .steps span{flex:1;text-align:center;font-size:12px;padding:4px;border-radius:6px;background:var(--panel2);color:var(--mute)}
 .steps span.on{background:var(--acc);color:#fff}
@@ -278,36 +281,72 @@ function deleteModal(name) {
 
 // ---------- add account / login wizard
 function nextName() { const used = new Set((DATA?.accounts || []).map(a => a.name)); for (let i = 1; i < 200; i++) if (!used.has("g" + i)) return "g" + i; return "g" + Date.now(); }
-function steps(i) { return '<div class="steps">' + ["1 名字和代理", "2 登录 Google", "3 检测"].map((s, k) => '<span class="' + (k === i ? "on" : "") + '">' + s + "</span>").join("") + "</div>"; }
+function steps(i) { return '<div class="steps">' + ["1 账号信息", "2 登录 Google", "3 检测"].map((s, k) => '<span class="' + (k === i ? "on" : "") + '">' + s + "</span>").join("") + "</div>"; }
 
 function addModal() {
   $("#modal").dataset.sticky = "1";
-  openModal('<h3>添加账号</h3>' + steps(0) +
-    '<div class="field"><label>账号名字（字母、数字、- 和 _，例如 g4）</label><input id="anName" value="' + nextName() + '"></div>' +
-    '<div class="field"><label>这个账号专用的代理（例如 socks5://用户名:密码@1.2.3.4:1080；输入时不显示）</label><input id="anProxy" type="password" autocomplete="off"></div>' +
+  let mode = "oauth";
+  openModal('<h3>添加新账号</h3>' +
+    '<div class="tabs"><button data-m="oauth" class="on">OAuth 授权</button><button data-m="token">Refresh Token</button></div>' +
+    '<div class="field"><label>账号名字（可以直接用 Google 邮箱，也可以随便起，例如 g4）</label><input id="anName" value="' + nextName() + '"></div>' +
+    '<div id="anTok" style="display:none"><div class="field"><label>Refresh Token</label><textarea id="rtVal" spellcheck="false" autocomplete="off" placeholder="在此处粘贴您的 Refresh Token\n\n支持格式：\n1. 单个 Token（1//...）\n2. JSON（含 refresh_token 字段，如导出的 {email, refresh_token}）\n3. 任意包含 Token 的文本（自动提取）"></textarea></div>' +
+    '<p class="small mute">只能用 Antigravity 登录得到的 refresh_token；Gemini CLI 等其它程序的不能用。写进这个账号的登录文件（权限 600），不记日志。</p></div>' +
+    '<div class="field"><label>代理（可选，例如 socks5://用户名:密码@1.2.3.4:1080；留空 = 用服务器本机网络）</label><input id="anProxy" type="password" autocomplete="off"></div>' +
     '<label class="small mute"><input type="checkbox" style="width:auto" onchange="anProxy.type=this.checked?\'text\':\'password\'"> 显示</label>' +
-    (DATA?.server?.require_proxy === false ? '<p class="small mute">这个网关允许不用代理，留空就直接用服务器本机网络。</p>' : '<p class="small mute">每个账号最好用一个不同出口 IP 的代理，避免多个账号被 Google 关联。</p>') +
-    '<p id="anRes" class="small"></p><div class="field"><label>已经用过的代理（不要重复用）</label><div id="anUsed"><span class="spin"></span></div></div>' +
-    '<div class="foot"><button onclick="cancelAdd()">取消</button><button class="primary" id="anNext">测试代理并继续</button></div>');
+    '<p class="small mute">每个账号最好用不同出口 IP 的代理，避免多个账号被 Google 关联；不想用代理可以留空。</p>' +
+    '<p id="anRes" class="small"></p><details><summary class="small">已经用过的代理</summary><div id="anUsed"><span class="spin"></span></div></details>' +
+    '<div class="foot"><button onclick="cancelAdd()">取消</button><button class="primary" id="anNext">继续</button></div>');
   proxyTable(true).then(h => { if ($("#anUsed")) $("#anUsed").innerHTML = h; });
+  const setMode = m => { mode = m; $("#anTok").style.display = m === "token" ? "block" : "none";
+    document.querySelectorAll(".tabs button").forEach(x => x.classList.toggle("on", x.dataset.m === m));
+    $("#anNext").textContent = m === "token" ? "确认添加" : "继续授权"; };
+  document.querySelectorAll(".tabs button").forEach(x => x.onclick = () => setMode(x.dataset.m));
+  setMode("oauth");
+  const auto = $("#anName").value;
+  $("#rtVal").oninput = () => { const m = $("#rtVal").value.match(/"email"\s*:\s*"([^"\s]+@[^"\s]+)"/); if (m && $("#anName").value === auto) $("#anName").value = m[1]; };
   $("#anNext").onclick = async e => {
-    const name = $("#anName").value.trim();
-    try { const r = await busy(e.target, () => api("/accounts", {body: {name, proxy: $("#anProxy").value.trim()}}));
+    const name = $("#anName").value.trim(), proxy = $("#anProxy").value.trim();
+    try {
+      const r = await busy(e.target, async () => {
+        const c = await api("/accounts", {body: {name, proxy}});
+        if (mode === "token") {
+          try { c.login = await api("/accounts/" + name + "/login/token", {body: {refresh_token: $("#rtVal").value}}); }
+          catch (err) { api("/accounts/" + name, {method: "DELETE"}).catch(() => {}); throw err; }
+        }
+        return c; });
       let msg = r.egress_ip ? "代理可用，出口 IP " + r.egress_ip + " " + (r.country || "") : "已创建";
       if (r.same_ip_as.length) msg += "（提醒：这个代理 / 出口 IP 以前被 " + r.same_ip_as.join("、") + " 用过）";
-      toast(msg, r.same_ip_as.length ? "bad" : "ok"); loginModal(name, true); refresh(); }
-    catch (err) { $("#anRes").innerHTML = '<span class="err">' + esc(err.message) + "</span>"; }
+      if (r.login) { msg = name + " 登录成功" + (r.login.email ? "（" + r.login.email + "）" : "");
+        if (r.login.same_email_as.length) msg += "；提醒：账号 " + r.login.same_email_as.join("、") + " 登录的也是这个 Google 账号"; }
+      toast(msg, (r.same_ip_as.length || (r.login && r.login.same_email_as.length)) ? "bad" : "ok"); refresh();
+      if (mode === "token") checkStep(name); else loginModal(name, true);
+    } catch (err) { $("#anRes").innerHTML = '<span class="err">' + esc(err.message) + "</span>"; }
   };
 }
 window.cancelAdd = () => { delete $("#modal").dataset.sticky; closeModal(); };
 
 function loginModal(name, wizard) {
   $("#modal").dataset.sticky = "1";
-  openModal('<h3>' + (wizard ? "添加账号 " : "重新登录 ") + esc(name) + '</h3>' + (wizard ? steps(1) : "") +
-    '<p>点「开始登录」后会出现一个 Google 登录按钮。</p><ol class="small"><li>点按钮在浏览器里打开 Google 页面，选这个账号要用的 Google 账号，同意授权。</li>' +
-    '<li>授权后浏览器会跳到一个<b>打不开的网址</b>（以 localhost 开头），或者页面上显示一串<b>授权码</b>。</li><li>把浏览器地址栏里的<b>整串网址</b>（或那串授权码）复制下来，粘贴到下面的框里，点「完成登录」。</li></ol>' +
-    '<div id="lgArea"><button class="primary" id="lgStart">开始登录</button></div><p id="lgRes" class="small"></p>' +
+  openModal('<h3>' + (wizard ? "添加账号 " : "重新登录 ") + esc(name) + '</h3>' +
+    '<div class="tabs"><button data-m="oauth" class="on">OAuth 授权</button><button data-m="token">Refresh Token</button></div>' +
+    '<div id="lgOauth"><ol class="small"><li>点「开始登录」，再点出现的按钮在浏览器里打开 Google 页面，选这个账号要用的 Google 账号，同意授权。</li>' +
+    '<li>授权后浏览器会跳到一个<b>打不开的网址</b>（以 localhost 开头），或者页面上显示一串<b>授权码</b>。</li><li>把地址栏里的<b>整串网址</b>（或授权码）粘贴到下面的框里，点「完成登录」。</li></ol>' +
+    '<div id="lgArea"><button class="primary" id="lgStart">开始登录</button></div><p id="lgRes" class="small"></p></div>' +
+    '<div id="lgTok" style="display:none"><div class="field"><label>Refresh Token</label><textarea id="rtVal" spellcheck="false" autocomplete="off" placeholder="在此处粘贴您的 Refresh Token（单个 1//... 或含 refresh_token 的 JSON）"></textarea></div>' +
+    '<p class="small mute">只能用 Antigravity 登录得到的 refresh_token。不能用时原来的登录不变。</p><p><button class="primary" id="rtGo">确认登录</button></p><p id="rtRes" class="small"></p></div>' +
     '<div class="foot"><button id="lgCancel">' + (wizard ? "以后再登录" : "取消") + "</button></div>");
+  document.querySelectorAll(".tabs button").forEach(x => x.onclick = () => {
+    document.querySelectorAll(".tabs button").forEach(y => y.classList.toggle("on", y === x));
+    $("#lgOauth").style.display = x.dataset.m === "oauth" ? "block" : "none"; $("#lgTok").style.display = x.dataset.m === "token" ? "block" : "none"; });
+  $("#rtGo").onclick = async e => {
+    try { const r = await busy(e.target, () => api("/accounts/" + name + "/login/token", {body: {refresh_token: $("#rtVal").value}}));
+      $("#rtVal").value = "";
+      let msg = name + " 登录成功" + (r.email ? "（" + r.email + "）" : "");
+      if (r.same_email_as.length) msg += "；提醒：账号 " + r.same_email_as.join("、") + " 登录的也是这个 Google 账号";
+      toast(msg, r.same_email_as.length ? "bad" : "ok");
+      if (wizard) checkStep(name); else { delete $("#modal").dataset.sticky; closeModal(); refresh(); } }
+    catch (err) { $("#rtRes").innerHTML = '<span class="err">' + esc(err.message) + "</span>"; }
+  };
   $("#lgCancel").onclick = async () => { api("/accounts/" + name + "/login/cancel", {body: {}}).catch(() => {}); delete $("#modal").dataset.sticky; closeModal(); refresh(); };
   $("#lgStart").onclick = async e => {
     try { const r = await busy(e.target, () => api("/accounts/" + name + "/login/start", {body: {}}));
