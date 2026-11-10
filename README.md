@@ -38,7 +38,7 @@ Agent / 应用 ──OpenAI 或 Anthropic 接口──▶ ACP-Ant（127.0.0.1:80
 - **三种接口**：`/v1/chat/completions`（OpenAI）、`/v1/responses`（OpenAI 新接口，Codex 用这个）、`/v1/messages`（Anthropic），都支持流式输出。
 - **工具调用**：Agent 声明的工具（OpenAI `tools`、Anthropic `tools`、Responses 的 function / custom 工具）会写进提示词交给模型。模型要用工具时，网关把它的回复转成标准的 `tool_calls` / `tool_use` / `function_call` 返回给 Agent。Agent 自己执行工具，再把结果发回来。支持一次调用多个工具，也支持 `tool_choice`。
 - **图片**：data URL、http(s) 图片链接（网关代为下载）、工具结果里的图片都可以。纯文本文件（txt / md / json / csv 等）会转成文字。
-- **视频、音频、PDF 等文件不支持，直接返回 400**：Antigravity 的 ACP 接口只把文字和图片交给模型，视频、音频、PDF 发过去会被它悄悄丢掉，模型照样回答，内容是编的（实测 agy 1.5.3，Gemini 4 Argon / Gemini 3.8 Flash 都一样）。所以网关遇到这类内容（OpenAI `file` / `input_audio` / `video_url`、Responses `input_file`、Anthropic PDF `document` 等）直接返回 400 并写明是哪一项，调用方可以换通道，或者把视频抽成图片帧再发。
+- **视频、音频、PDF 等文件默认不支持，直接返回 400**（想让 Gemini 看视频，见下面的[视频模式](#视频模式试验功能默认关闭)）：Antigravity 的 ACP 接口只把文字和图片交给模型，视频、音频、PDF 发过去会被它悄悄丢掉，模型照样回答，内容是编的（实测 agy 1.5.3，Gemini 4 Argon / Gemini 3.8 Flash 都一样）。所以网关遇到这类内容（OpenAI `file` / `input_audio` / `video_url`、Responses `input_file`、Anthropic PDF `document` 等）直接返回 400 并写明是哪一项，调用方可以换通道，或者把视频抽成图片帧再发。
 - **每个账号一个独立目录**：`agy` 的 HOME 指向这个目录，登录凭据只存在这里，账号之间互不串。
 - **每个账号一个独立代理**（可选）：`http://`、`https://`、`socks5://`，可带用户名密码。添加时会测出口 IP 和国家，两个账号用了同一个 IP 会提醒。
 - **Antigravity 自己不碰你的机器**：网关给 `agy` 注册的 agent 没有任何内置工具，权限请求一律拒绝。工具只在 Agent 那边执行。
@@ -286,10 +286,32 @@ ACP 协议没有 `temperature`、`max_tokens` 参数，这两个字段会被忽�
 | 被 Antigravity 审核拦截 | 不换号（换了也一样） | 400 |
 | 模型名不存在（关了兜底时） | 不换号 | 400 |
 | 请求里有视频、音频、PDF 等模型收不到的内容，或图片链接下载不了 | 不发给模型 | 400，写明是第几条消息的第几项 |
+| 视频模式下模型想读附件以外的文件 | 立刻取消这次请求，不换号 | 400 |
 | 所有账号都满了 | 排队，哪个账号先空出来就交给哪个 | 290 秒内没排上：503（Anthropic 格式 529） |
 | 超时 | 默认 290 秒 | 504 |
 
 Anthropic 格式下，「没有可用账号」返回 529（overloaded），Claude 系客户端会自动重试。冷却时间等所有选项见 [gateway.env.example](gateway.env.example)。
+
+## 视频模式（试验功能，默认关闭）
+
+在 `gateway.env` 里加一行 `AGY_VIDEO_MODE=1` 并重启后，**Gemini 模型可以看视频、听音频、读 PDF**。其它模型照旧返回 400。
+
+- **怎么发**：和发图片一样，把文件用 base64 直接放在请求里。OpenAI 的 `file`（`file_data` 写 `data:video/mp4;base64,...`）、`video_url` / `audio_url`（data URL）、`input_audio`，Responses 的 `input_file` / `input_audio`，Anthropic 的 `document`（PDF）都可以。**不下载链接**，发 http 链接会返回 400。
+- **限制**：单个文件默认最大 40 MB（`AGY_VIDEO_MAX_MB`），一次请求最多 5 个（`AGY_VIDEO_MAX_FILES`）。可用的模型由 `AGY_VIDEO_MODELS` 决定，默认所有 `gemini-` 开头的。
+- **速度**：实测 25 秒、23 MB 的竖屏口播视频，Gemini 4 Argon 约 25–30 秒给出按时间顺序的画面、字幕和口播内容；9 秒的小视频约 12 秒。声音的时间点不一定准。
+
+**为什么默认关闭。** Antigravity 的 ACP 接口不收视频，唯一的办法是把文件放到服务器上，让模型用它自带的 `read_file` 工具去读。这等于给模型开了一个读服务器文件的工具，所以网关做了三层防护：
+
+1. **单独的进程，专用的空目录。** 只有带视频 / 音频 / PDF 的请求才会用到每个账号的第二个 `agy` 进程，它只有 `read_file` 一个工具。它的 HOME 是 `accounts/<名字>/media/`（空的，没有 `proxy.env`，没有日志；代理通过环境变量传给它，登录目录用 `--gemini-dir` 参数单独指给它，这个目录受 `agy` 自身保护，`read_file` 读不到），临时目录是 `media/tmp/`，工作目录是空的。实测 `agy` 1.5.3 只允许不经授权读取「当前会话的工作目录」和「临时目录」，其它路径都要申请授权，网关一律拒绝。
+2. **网关盯着每一次读文件。** 模型每次用 `read_file`，网关都会核对路径。只要不是本次请求的附件，立刻取消这次请求，返回 400，模型之后写的任何内容都不会发给调用方。
+3. **用完即删。** 每次请求的附件写在一个随机命名的专用目录里（`media/w/<32 位随机字符>/`，别的请求猜不到，也列不出来），请求结束立刻删除，`agy` 自己留的对话记录和视频副本也一起删。网关启动时会清掉上次异常退出留下的文件。
+
+实测（agy 1.5.3，Gemini 4 Argon）：在账号目录、日志目录、HOME、临时目录、别的请求的目录、`/tmp`、`/var/tmp`、家目录各放一个带暗号的文件，再加上 `proxy.env` 和 `/proc/self/environ`，用三种接口各种说法让模型去读，暗号一次都没有出现在回复里。把 agent 说明故意换成「让你读什么就读什么」再测一遍，网关拦下了全部 20 次越界读取。
+
+**仍然要知道的：**
+- 这是靠「`agy` 的授权机制 + 网关核对路径」来保证的，不是操作系统级的隔离。`agy` 升级后行为可能变，升级后请重新跑一遍测试。想更稳妥，可以把整个网关放进 Docker 或单独的系统用户里。
+- 模型的回答里偶尔会带上附件在服务器上的路径（只是路径，没有内容）。
+- 视频模式的进程在第一次用到时才启动，第一次请求会多几秒。
 
 ## 安全与隐私
 
@@ -305,6 +327,7 @@ Anthropic 格式下，「没有可用账号」返回 529（overloaded），Claud
 - `python3 /opt/acp-ant/agent_test.py [模型名]`：Agent 相关测试（三种接口的工具调用、流式、JSON 模式）。
 - `HOME=/opt/acp-ant/accounts/g1 HTTPS_PROXY=<代理地址> python3 /opt/acp-ant/acp_probe.py --prompt "Reply with OK"`：直接和 `agy acp` 握手，打印协议往来（看账号有哪些模型和思考档位）。
 - 在源码目录里 `/opt/acp-ant/venv/bin/python scripts/content_test.py`：离线测试（不用账号、不联网），检查视频 / 音频 / PDF 等会返回 400、文字和图片照常通过。
+- `/opt/acp-ant/venv/bin/python scripts/video_mode_test.py`：视频模式的离线测试（同样不用账号、不联网）。
 - 日志：`journalctl -u acp-ant -f`；每个账号的 `agy` 日志在 `accounts/<名字>/gw/`。
 
 ## 免责声明
@@ -332,7 +355,8 @@ ACP-Ant turns Google's official **Antigravity CLI (`agy`)** into a standard LLM 
 - **Three APIs:** `/v1/chat/completions`, `/v1/responses` (used by Codex CLI) and `/v1/messages`, all with streaming.
 - **Tool calling:** OpenAI `tools`, Anthropic `tools`, and Responses function and custom tools are described to the model. Its requests come back as native `tool_calls` / `tool_use` / `function_call` items. Your agent runs the tools; Antigravity itself has no tools and every permission request is refused.
 - **Images:** data URLs, http(s) image links (downloaded by the gateway) and images inside tool results. Plain-text files (txt / md / json / csv …) are passed as text.
-- **No video, audio or PDF: HTTP 400 instead.** Antigravity's ACP interface hands only text and images to the model. Video, audio and PDF content is silently dropped there, and the model answers anyway with made-up content (measured with agy 1.5.3 on Gemini 4 Argon and Gemini 3.8 Flash). So OpenAI `file` / `input_audio` / `video_url` parts, Responses `input_file`, Anthropic PDF `document` blocks and the like get a 400 that names the offending part, and the caller can fall back to another provider or send video frames as images.
+- **No video, audio or PDF by default: HTTP 400 instead** (see video mode below). Antigravity's ACP interface hands only text and images to the model. Video, audio and PDF content is silently dropped there, and the model answers anyway with made-up content (measured with agy 1.5.3 on Gemini 4 Argon and Gemini 3.8 Flash). So OpenAI `file` / `input_audio` / `video_url` parts, Responses `input_file`, Anthropic PDF `document` blocks and the like get a 400 that names the offending part, and the caller can fall back to another provider or send video frames as images.
+- **Video mode (experimental, off by default, `AGY_VIDEO_MODE=1`):** lets Gemini models watch video, hear audio and read PDFs sent inline as base64 (no link downloads; 40 MB per file and 5 files per request by default). Antigravity's ACP interface accepts no video, so the only way is to put the file on the server and let the model open it with its own `read_file` tool. ACP-Ant guards that in three layers. (1) Such requests run in a second `agy` process per account that has `read_file` as its only tool, with a dedicated HOME (no `proxy.env`, no logs; the proxy comes through the environment), a private temp directory and an empty working directory. agy 1.5.3 reads without permission only inside the session's working directory and the temp directory; everything else raises a permission request, which the gateway refuses. (2) The gateway checks every `read_file` call: a path that is not an attachment of this request cancels the request with a 400, and nothing the model writes afterwards reaches the caller. (3) Attachments live in a per-request directory with a random 128-bit name and are deleted when the request ends, together with agy's own copies. Tested with canary files in the account directory, logs, HOME, temp directory, another request's directory, `/tmp`, `/var/tmp` and the home directory: none leaked, also with an agent deliberately told to open anything (20 of 20 out-of-bounds reads stopped). This relies on agy's permission system plus the gateway's check, not on OS-level isolation; rerun the tests after upgrading agy.
 - **Isolation:** each account has its own HOME directory, so credentials stay separate, and optionally its own HTTP/SOCKS5 proxy.
 - **Load spreading:** requests go to the least busy account, round-robin among equals. Each account runs up to 3 requests at once (`AGY_PER_ACCOUNT`, also settable live in the panel). Extra requests queue, first come first served, for whichever account frees a slot first.
 - **Stream keep-alive:** after 15 silent seconds (`AGY_HEARTBEAT`), a stream sends an SSE comment or an Anthropic `ping` event, so Cloudflare and other proxies don't cut long thinking or long tool calls. Cloudflare cuts a connection after 100 s with no data.

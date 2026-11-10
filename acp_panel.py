@@ -343,10 +343,9 @@ def _set_enabled(home: str, enabled: bool) -> None:
 
 async def restart_acp(acc) -> None:
     acc.cooldown_until, acc.cooldown_kind, acc.disabled_reason = 0.0, "", ""
-    if acc.acp:
-        await acc.acp.stop()
-        if acc.enabled:
-            asyncio.create_task(acc.acp.prewarm())
+    await acc.stop_processes()     # the video-mode process (if any) starts again with its next request
+    if acc.acp and acc.enabled:
+        asyncio.create_task(acc.acp.prewarm())
 
 
 AUTH_WORDS = re.compile(r"sign in|not logged in|unauthenticated|authentication required|invalid_grant|needs a new login", re.I)
@@ -738,8 +737,8 @@ async def api_delete(name: str, request: Request):
         raise HTTPException(404, "没有这个账号：%s" % name)
     drop_login(name)
     acc = core.POOL.accounts.pop(name, None)
-    if acc and acc.acp:
-        await acc.acp.stop()
+    if acc:
+        await acc.stop_processes()
     px = core.read_proxy(home)
     if px:   # the history keeps proxies of deleted accounts too
         remember_proxy(name, px["HTTPS_PROXY"], read_text(os.path.join(home, "egress_ip.txt")), read_text(os.path.join(home, "egress_country.txt")))
