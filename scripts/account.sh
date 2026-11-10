@@ -19,7 +19,7 @@ REQUIRE_PROXY=${AGY_REQUIRE_PROXY:-0}
 ME=$(basename "$0")
 
 die() { echo "错误：$*" >&2; exit 1; }
-need_name() { [[ "${1:-}" =~ ^[a-zA-Z0-9_-]{1,32}$ ]] || die "名字只能用字母、数字、- 和 _（最长 32 个字符），例如 g1、pro-01"; }
+need_name() { [[ "${1:-}" =~ ^[a-zA-Z0-9_@+][a-zA-Z0-9_.@+-]{0,63}$ && "${1:-}" != *..* ]] || die "名字只能用字母、数字和 - _ . @ +（最长 64 个字符），可以直接用 Google 邮箱，例如 g1、me@gmail.com"; }
 mask() { sed -E 's#^([a-z0-9]+://)(.*@)?([^@/]+).*#\1\3#' <<<"$1"; }   # 只留 协议://主机:端口，去掉账号密码
 no_proxy_ok() { [ "$REQUIRE_PROXY" = 0 ] || [ "$REQUIRE_PROXY" = false ] || [ "$REQUIRE_PROXY" = no ]; }
 

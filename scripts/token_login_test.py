@@ -190,5 +190,17 @@ r = create("np2")
 check("AGY_REQUIRE_PROXY=1 still demands a proxy", isinstance(r, HTTPException) and r.status_code == 400, r)
 check("default is proxy optional", not gw._env_bool("AGY_NO_SUCH_VAR_FOR_TEST", False))
 
+gw.REQUIRE_PROXY = False
+for nm in ("me@gmail.com", "a.b+c@x.co", "g9"):
+    r = create(nm)
+    check("e-mail style account name accepted: " + nm, isinstance(r, dict) and r.get("ok"), r)
+for bad in ("../x", "a/b", "a..b@x", ".hidden", "-x", "x" * 65, "a b"):
+    r = create(bad)
+    check("bad account name refused: " + bad[:12], isinstance(r, HTTPException) and r.status_code == 400, r)
+check("e-mail named account dir exists", os.path.isdir(os.path.join(ACC, "me@gmail.com")))
+VERDICT[os.path.join(ACC, "me@gmail.com")] = (True, "gemini-4-argon-high" + chr(10), "me@gmail.com")
+r = call("me@gmail.com", RT)
+check("token login works on e-mail named account", isinstance(r, dict) and r.get("ok"), r)
+
 print("\n%d/%d passed" % (sum(results), len(results)))
 sys.exit(0 if all(results) else 1)

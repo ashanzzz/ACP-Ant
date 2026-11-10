@@ -44,7 +44,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HTML_FILE = os.path.join(HERE, "panel.html")
 COOKIE = "acpant_panel"
 SESSION_SECONDS = 7 * 24 * 3600
-NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,32}$")
+NAME_RE = re.compile(r"^[a-zA-Z0-9_@+][a-zA-Z0-9_.@+-]{0,63}$")   # e-mail addresses are fine as account names
 PROXY_RE = re.compile(r"^(https?|socks5h?)://\S+:[0-9]{2,5}/?$")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\r")
 DEFAULT_SETTINGS = {"auto_check": True, "check_hours": 6, "prompt_check": False, "update_check": True}
@@ -290,8 +290,8 @@ def get_account(name: str):
 
 
 def home_of(name: str) -> str:
-    if not NAME_RE.match(name or ""):
-        raise HTTPException(400, "名字只能用字母、数字、- 和 _（最长 32 个字符）")
+    if not NAME_RE.match(name or "") or ".." in name:
+        raise HTTPException(400, "名字只能用字母、数字和 - _ . @ +（最长 64 个字符），可以直接用 Google 邮箱")
     return os.path.join(core.ACCOUNTS_DIR, name)
 
 
