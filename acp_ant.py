@@ -40,6 +40,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+try:
+    from jsonrepair import jsonrepair
+except ImportError:
+    jsonrepair = None
 import logging
 import os
 import re
@@ -1437,8 +1441,8 @@ def _calls_block(calls: list[dict]) -> str:
     arr = []
     for c in calls:
         try:
-            args = json.loads(c["arguments"]) if isinstance(c["arguments"], str) else c["arguments"]
-        except ValueError:
+            args = json.loads(c["arguments"], strict=False) if isinstance(c["arguments"], str) else c["arguments"]
+        except (ValueError, TypeError):
             args = c["arguments"]
         arr.append({"name": c["name"], "arguments": args})
     return "<tool_calls>\n" + json.dumps(arr, ensure_ascii=False) + "\n</tool_calls>"
@@ -1601,29 +1605,32 @@ async def fetch_remote_images(msgs: list[dict]) -> None:
 # ======================================================================================================
 
 TAG_OPEN, TAG_CLOSE = "<tool_calls>", "</tool_calls>"
+ALT_OPEN, ALT_CLOSE = "<function_calls>", "</function_calls>"
+OPEN_TAGS = (TAG_OPEN, "<tool_call>", ALT_OPEN)
 
 
 def _loads_lenient(s: str) -> Any:
     s = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", s.strip())
     try:
-        return json.loads(s)
-    except ValueError:
+        return json.loads(s, strict=False)
+    except Exception:
         pass
     for a, b in (("[", "]"), ("{", "}")):
         i, j = s.find(a), s.rfind(b)
         if 0 <= i < j:
             try:
-                return json.loads(s[i:j + 1])
-            except ValueError:
+                return json.loads(s[i:j + 1], strict=False)
+            except Exception:
                 continue
+    if jsonrepair is not None:
+        try:
+            return json.loads(jsonrepair(s), strict=False)
+        except Exception:
+            pass
     return None
 
 
 # Claude-family models sometimes fall back to their own XML tool format; accept it too.
-ALT_OPEN, ALT_CLOSE = "<function_calls>", "</function_calls>"
-OPEN_TAGS = (TAG_OPEN, ALT_OPEN)
-
-
 def _parse_invokes(body: str) -> list[dict]:
     calls = []
     for m in re.finditer(r'<invoke name="([^"]+)">(.*?)(?:</invoke>|$)', body, re.S):
@@ -1634,7 +1641,7 @@ def _parse_invokes(body: str) -> list[dict]:
             v = v[:-1] if v.endswith("\n") else v
             if v.strip()[:1] in ("{", "[") or v.strip() in ("true", "false", "null") or re.fullmatch(r"-?\d+(\.\d+)?", v.strip()):
                 try:
-                    args[p.group(1)] = json.loads(v)
+                    args[p.group(1)] = json.loads(v, strict=False)
                     continue
                 except ValueError:
                     pass
@@ -1645,16 +1652,24 @@ def _parse_invokes(body: str) -> list[dict]:
 
 def parse_tool_calls(text: str) -> tuple[str, list[dict] | None]:
     """Split the model's reply into (text before the block, [{"name", "arguments"(dict|str)}]) or (text, None)."""
-    i = text.find(TAG_OPEN)
-    if i < 0:
+    tag_open, tag_close = None, None
+    i = -1
+    for topen, tclose in ((TAG_OPEN, TAG_CLOSE), ("<tool_call>", "</tool_call>")):
+        pos = text.find(topen)
+        if pos >= 0 and (i < 0 or pos < i):
+            i = pos
+            tag_open, tag_close = topen, tclose
+
+    if i < 0 or tag_open is None or tag_close is None:
         k = text.find(ALT_OPEN)
         if k >= 0:
             calls = _parse_invokes(text[k:])
             if calls:
                 return re.sub(r"\n?```[a-zA-Z]*\s*$", "", text[:k]).rstrip(), calls
         return text, None
-    body = text[i + len(TAG_OPEN):]
-    j = body.find(TAG_CLOSE)
+
+    body = text[i + len(tag_open):]
+    j = body.find(tag_close)
     if j >= 0:
         body = body[:j]
     data = _loads_lenient(body)
@@ -1669,9 +1684,13 @@ def parse_tool_calls(text: str) -> tuple[str, list[dict] | None]:
         args = next((c[k] for k in ("arguments", "input", "parameters", "args") if k in c), f.get("arguments", {}))
         if isinstance(args, str):
             try:
-                args = json.loads(args) if args.strip() else {}
+                args = json.loads(args, strict=False) if args.strip() else {}
             except ValueError:
-                pass   # leave the raw string; the client will see what the model wrote
+                if jsonrepair is not None:
+                    try:
+                        args = json.loads(jsonrepair(args), strict=False)
+                    except Exception:
+                        pass
         if name:
             calls.append({"name": str(name), "arguments": args if args is not None else {}})
     if not calls:
