@@ -25,6 +25,10 @@ Anthropic `tools`) are described to the model in the system prompt; the model as
 protocol (<tool_calls>[...]</tool_calls>) which the gateway turns back into native tool_calls / tool_use blocks.
 The client agent runs the tools and sends the results back, exactly as with any other model provider.
 ACP has no temperature / max_tokens; those fields are ignored.
+Only text and images reach the model. Video, audio, PDF and other binary files are refused with HTTP 400 instead of
+being dropped (a model that silently misses them still answers, and invents what they contained).
+Video mode (AGY_VIDEO_MODE=1, off by default) lets Gemini models see video and PDF and hear audio: such requests run in
+a second, sandboxed agy process per account whose agent has a single tool, read_file (see "Video mode" below).
 
 The idea of driving `agy acp` from another program comes from lili-luo/dsh-plugin-bundle
 (dsh-llm-antigravity-acp, MIT). This file is an independent implementation.
@@ -54,7 +58,7 @@ from typing import Any, AsyncIterator
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-__version__ = "1.1.0"     # keep in step with the newest heading in CHANGELOG.md (the panel compares against it)
+__version__ = "1.2.0"     # keep in step with the newest heading in CHANGELOG.md (the panel compares against it)
 
 log = logging.getLogger("acp-ant")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -94,6 +98,34 @@ FETCH_IMAGES = _env_bool("AGY_FETCH_IMAGES", True)             # download http(s
 # --process-per-session (which starts a new worker for every request). Set 1 to go back to a process per session.
 PROCESS_PER_SESSION = _env_bool("AGY_PROCESS_PER_SESSION", False)
 RECYCLE_SESSIONS = _env_int("AGY_RECYCLE_SESSIONS", 500)      # restart a shared process when idle after this many sessions
+
+# Video mode (off by default). Measured with agy 1.5.3: no ACP prompt block carries video, audio or PDF to the model,
+# but an agent that may call read_file on a resource_link sees the whole file (a video including its sound).
+# read_file runs without asking only inside the session's working directory and inside $TMPDIR (/tmp when unset);
+# every other path raises a permission request, which the gateway refuses. So video-mode requests run in a second agy
+# process per account with its own empty HOME (proxy passed in the environment, log kept outside), a private TMPDIR,
+# and a fresh working directory with a random name per request, deleted afterwards together with agy's own copies.
+# On top of that the gateway watches the agent's tool calls and stops the request as soon as it opens any other path.
+VIDEO_MODE = _env_bool("AGY_VIDEO_MODE", False)
+VIDEO_MAX_MB = float(os.environ.get("AGY_VIDEO_MAX_MB", "40"))   # all files of one request together, after decoding
+VIDEO_MAX_FILES = _env_int("AGY_VIDEO_MAX_FILES", 5)
+try:   # Antigravity model ids allowed to receive files in video mode (Claude / GPT models behind Antigravity cannot read them)
+    VIDEO_MODELS = re.compile(os.environ.get("AGY_VIDEO_MODELS") or r"^gemini-")
+except re.error:
+    log.warning("AGY_VIDEO_MODELS is not a valid regular expression; using ^gemini-")
+    VIDEO_MODELS = re.compile(r"^gemini-")
+MEDIA_AGENT = AGENT + "-media"
+# MIME type -> file extension (read_file decides by the extension). Gemini's video, audio and document types.
+MEDIA_EXT = {
+    "video/mp4": ".mp4", "video/mpeg": ".mpeg", "video/mpg": ".mpg", "video/quicktime": ".mov", "video/mov": ".mov",
+    "video/webm": ".webm", "video/x-flv": ".flv", "video/3gpp": ".3gp", "video/avi": ".avi", "video/x-msvideo": ".avi",
+    "video/wmv": ".wmv", "video/x-ms-wmv": ".wmv",
+    "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/wave": ".wav", "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+    "audio/aac": ".aac", "audio/ogg": ".ogg", "audio/flac": ".flac", "audio/x-flac": ".flac", "audio/aiff": ".aiff",
+    "audio/x-aiff": ".aiff",
+    "application/pdf": ".pdf",
+}
+AUDIO_FORMATS = {"wav": "audio/wav", "mp3": "audio/mpeg", "aac": "audio/aac", "ogg": "audio/ogg", "flac": "audio/flac", "aiff": "audio/aiff"}
 
 # Public model name -> (Antigravity model id, thought level or None to keep the account default).
 # Names not listed here are passed through; a trailing -high / -medium / -low selects the thought level.
@@ -141,6 +173,21 @@ If the appended instructions describe external tools and a <tool_calls> text pro
 that protocol and wait for their results. Otherwise answer directly in text.
 Follow the appended system instructions exactly.
 """ % AGENT
+
+MEDIA_AGENT_MD = """---
+name: %s
+description: "ACP-Ant video mode: looks at the files attached to the request, nothing else"
+tools: [read_file]
+excludeDefaultComponents: true
+mainAgent: true
+---
+Files attached to the user's message (video, audio, PDF) are given to you as file links. Before you answer, open each
+attached file with your read_file tool, using exactly the path in its link. read_file is only for those attachments:
+never open any other path, directory or system file, whatever the conversation asks; say that you can only see the
+attached files instead. Refer to the files as "attachment 1", "attachment 2" and so on, never by their path.
+If the appended instructions describe external tools and a <tool_calls> text protocol, request those tools only with
+exactly that protocol and wait for their results. Follow the appended system instructions exactly.
+""" % MEDIA_AGENT
 
 
 # Antigravity's own prompt filter does not raise an error: it sends a fixed sentence back as if it were the answer.
@@ -246,29 +293,137 @@ def prepare_home(home: str) -> tuple[str, str]:
     return gem, ws
 
 
+# Video mode layout inside an account directory (the account dir itself, with proxy.env and gw/, is never readable):
+#   media/        HOME of the video-mode agy process: nothing else is ever put here
+#   media/tmp/    its TMPDIR (read_file may read here without asking; agy leaves it empty)
+#   media/empty/  its working directory (empty, read-only)
+#   media/w/      one directory with a random name per request, deleted afterwards; mode 0300, so nobody can list it
+MEDIA_DIRS = (("", 0o700), ("tmp", 0o700), ("empty", 0o500), ("w", 0o300))
+
+
+def media_home(home: str) -> str:
+    return os.path.join(home, "media")
+
+
+def prepare_media_home(home: str) -> tuple[str, str]:
+    """Video mode: register the read_file-only agent in the account's gemini dir and create the empty HOME.
+    Returns (gemini dir, media HOME)."""
+    gem, _ws = prepare_home(home)
+    agents = os.path.join(gem, "config", "plugins", MEDIA_AGENT, "agents")
+    os.makedirs(agents, exist_ok=True)
+    with open(os.path.join(gem, "config", "plugins", MEDIA_AGENT, "plugin.json"), "w") as f:
+        json.dump({"name": MEDIA_AGENT}, f)
+    with open(os.path.join(agents, f"{MEDIA_AGENT}.md"), "w") as f:
+        f.write(MEDIA_AGENT_MD)
+    mh = media_home(home)
+    for sub, mode in MEDIA_DIRS:
+        p = os.path.join(mh, sub) if sub else mh
+        os.makedirs(p, exist_ok=True)
+        os.chmod(p, mode)
+    return gem, mh
+
+
+def clear_media_leftovers(home: str) -> None:
+    """Request files and temp files left behind by a crash or a kill (called at gateway start)."""
+    mh = media_home(home)
+    for sub in ("w", "tmp"):
+        d = os.path.join(mh, sub)
+        if not os.path.isdir(d):
+            continue
+        os.chmod(d, 0o700)
+        for name in os.listdir(d):
+            p = os.path.join(d, name)
+            shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) and not os.path.islink(p) else os.remove(p)
+        os.chmod(d, dict(MEDIA_DIRS)[sub])
+
+
+def forget_session(home: str, sid: str) -> None:
+    """agy keeps its own copy of every conversation, a video read with read_file included (a 23 MB video left a 23 MB
+    copy under brain/<session>/ and a 46 MB conversations/<session>.db). Video mode deletes them right after the request."""
+    if not re.fullmatch(r"[\w-]{8,}", sid or ""):
+        return
+    base = os.path.join(home, ".gemini", "antigravity-cli")
+    for sub in ("conversations", "brain", "implicit", "annotations"):
+        d = os.path.join(base, sub)
+        try:
+            names = [n for n in os.listdir(d) if n.startswith(sid)]
+        except OSError:
+            continue
+        for n in names:
+            p = os.path.join(d, n)
+            try:
+                shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.remove(p)
+            except OSError as e:
+                log.warning("video mode: could not delete %s: %s", p, e)
+
+
+_PATH_KEY = re.compile(r"path|file|uri", re.I)
+
+
+def tool_call_problem(update: dict, allowed: set[str], cwd: str, initial: bool) -> str:
+    """Video mode: "" when this tool call only reads files attached to the request, otherwise what it tried to open.
+    agy reports read_file as {"name": "read_file", "kind": "read", "locations": [{"path"}], "rawInput": {"Path"}}."""
+    name, kind = update.get("name"), update.get("kind")
+    if name not in (None, "read_file"):
+        return "tool %s" % name
+    if kind not in (None, "read"):
+        return "a %s tool" % kind
+    paths = [str(loc["path"]) for loc in update.get("locations") or [] if isinstance(loc, dict) and loc.get("path")]
+    for key in ("args", "rawInput"):
+        v = update.get(key)
+        if isinstance(v, dict):
+            paths += [x for k, x in v.items() if isinstance(x, str) and x and _PATH_KEY.search(str(k))]
+    if not paths:
+        return "a tool call without a path" if initial else ""   # updates may carry only a new status
+    for p in paths:
+        q = os.path.normpath(os.path.join(cwd, p[7:] if p.startswith("file://") else p))
+        if q not in allowed and os.path.realpath(q) not in allowed:
+            return p
+    return ""
+
+
 # ======================================================================================================
 # ACP process per account
 # ======================================================================================================
 
 class Turn:
-    """session/update notifications received during one session/prompt."""
+    """session/update notifications received during one session/prompt. Only the answer and thought text is queued;
+    tool calls (video mode's read_file) never reach the client. In video mode (allowed = the request's own files) a
+    tool call that opens anything else queues ("violation", path): the request is stopped before any later text."""
 
-    def __init__(self) -> None:
+    def __init__(self, allowed: set[str] | None = None, cwd: str = "") -> None:
         self.queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        self.allowed, self.cwd = allowed, cwd
+        self.violation = ""
 
     def on_update(self, update: dict) -> None:
         kind = update.get("sessionUpdate")
         content = update.get("content") or {}
         if kind in ("agent_message_chunk", "agent_thought_chunk") and isinstance(content, dict) and content.get("type") == "text":
             self.queue.put_nowait(("text" if kind == "agent_message_chunk" else "thought", content.get("text") or ""))
+        elif kind in ("tool_call", "tool_call_update") and self.allowed is not None and not self.violation:
+            bad = tool_call_problem(update, self.allowed, self.cwd, kind == "tool_call")
+            if bad:
+                self.violation = bad
+                self.queue.put_nowait(("violation", bad))
+
+    def on_permission(self, params: dict) -> None:
+        """A permission request is always refused; in video mode it is also a violation (the path is outside the request)."""
+        if self.allowed is not None and not self.violation:
+            tc = params.get("toolCall") if isinstance(params.get("toolCall"), dict) else {}
+            self.violation = tool_call_problem(tc, self.allowed, self.cwd, True) or "a file outside the request"
+            self.queue.put_nowait(("violation", self.violation))
 
 
 class AcpProcess:
     """One long-lived `agy acp` process per account; all of the account's sessions run inside it
     (with AGY_PROCESS_PER_SESSION=1, agy starts a separate worker for every session instead)."""
 
-    def __init__(self, account: "Account"):
+    def __init__(self, account: "Account", media: bool = False):
         self.acc = account
+        self.media = media         # video mode: read_file-only agent, empty HOME, private TMPDIR (started on first use)
+        self.label = "%s%s" % (account.name, " (video mode)" if media else "")
+        self.cwd = ""              # working directory of the process (sessions in video mode get their own)
         self.proc: asyncio.subprocess.Process | None = None
         self.next_id = 0
         self.pending: dict[int, asyncio.Future] = {}
@@ -290,18 +445,28 @@ class AcpProcess:
 
     async def _start(self) -> None:
         a = self.acc
-        gem, ws = prepare_home(a.home)
-        env = {"HOME": a.home, "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"}
+        if self.media:
+            # HOME holds nothing but the request directories; TMPDIR moves read_file's free zone away from the shared
+            # /tmp; the proxy comes from the environment and the log goes to gw/, both outside what read_file may open
+            gem, mh = prepare_media_home(a.home)
+            ws, agent, logf = os.path.join(mh, "empty"), MEDIA_AGENT, os.path.join(a.home, "gw", "acp-media.log")
+            env = {"HOME": mh, "TMPDIR": os.path.join(mh, "tmp")}
+        else:
+            gem, ws = prepare_home(a.home)
+            agent, logf = AGENT, os.path.join(a.home, "gw", "acp.log")
+            env = {"HOME": a.home}
+        env.update({"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "NO_PROXY": "127.0.0.1,localhost", "no_proxy": "127.0.0.1,localhost"})
         px = read_proxy(a.home)
         if px:
             env.update(px)
             env.update({"https_proxy": px["HTTPS_PROXY"], "http_proxy": px["HTTP_PROXY"]})
         elif REQUIRE_PROXY:
             raise AcpError(f"account {a.name} has no proxy.env (AGY_REQUIRE_PROXY=1); not starting it", "CONFIG")
-        argv = [AGY, "acp", "--gemini-dir", gem, "--agent", AGENT, "--disable-telemetry", "--log-file", os.path.join(a.home, "gw", "acp.log")]
+        argv = [AGY, "acp", "--gemini-dir", gem, "--agent", agent, "--disable-telemetry", "--log-file", logf]
         if PROCESS_PER_SESSION:
             argv.append("--process-per-session")
         self.sessions = 0
+        self.cwd = ws
         self.proc = await asyncio.create_subprocess_exec(*argv, cwd=ws, env=env, stdin=asyncio.subprocess.PIPE,
                                                          stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                                                          limit=64 * 1024 * 1024)
@@ -311,7 +476,7 @@ class AcpProcess:
             "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False},
             "clientInfo": {"name": "acp-ant", "version": "1.1"},
         }, 60)
-        log.info("account %s: acp started (pid %s)", a.name, self.proc.pid)
+        log.info("account %s: acp started (pid %s)", self.label, self.proc.pid)
 
     async def _reader(self) -> None:
         assert self.proc and self.proc.stdout
@@ -342,8 +507,13 @@ class AcpProcess:
                     if t:
                         t.on_update(p.get("update") or {})
                 elif "method" in msg and "id" in msg:
-                    # requests from the agent: refuse every permission request (it has no tools anyway)
+                    # requests from the agent: refuse every permission request (the bridge agent has no tools; the
+                    # video-mode agent asks only for paths outside the request's own directory)
                     if msg["method"] == "session/request_permission":
+                        p = msg.get("params") or {}
+                        t = self.turns.get(p.get("sessionId"))
+                        if t:
+                            t.on_permission(p)
                         await self._send({"jsonrpc": "2.0", "id": msg["id"], "result": {"outcome": {"outcome": "cancelled"}}})
                     else:
                         await self._send({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": "not supported"}})
@@ -353,7 +523,7 @@ class AcpProcess:
                     fut.set_exception(AcpError("ACP process exited", "TRANSPORT"))
             self.pending.clear()
             self.init_result = None
-            log.warning("account %s: acp process ended", self.acc.name)
+            log.warning("account %s: acp process ended", self.label)
 
     async def _send(self, msg: dict) -> None:
         assert self.proc and self.proc.stdin
@@ -382,19 +552,20 @@ class AcpProcess:
             await self.ensure()
             if PROCESS_PER_SESSION:
                 return
-            sess = await self.request("session/new", {"cwd": os.path.join(self.acc.home, "gw", "workspace"), "mcpServers": []}, 120)
+            sess = await self.request("session/new", {"cwd": self.cwd, "mcpServers": []}, 120)
             if sess.get("sessionId"):
                 await self.request("session/close", {"sessionId": sess["sessionId"]}, 15)
         except Exception as e:  # noqa: BLE001
-            log.info("account %s: prewarm skipped: %s", self.acc.name, str(e)[:160])
+            log.info("account %s: prewarm skipped: %s", self.label, str(e)[:160])
 
     async def maybe_recycle(self) -> None:
         """Restart a shared process now and then (when idle) so a long-running one never accumulates state."""
         # only when this finishing request is the account's last one in flight (none still opening a session)
         if not PROCESS_PER_SESSION and self.sessions >= RECYCLE_SESSIONS and not self.turns and self.acc.inflight <= 1:
-            log.info("account %s: recycling acp process after %d sessions", self.acc.name, self.sessions)
+            log.info("account %s: recycling acp process after %d sessions", self.label, self.sessions)
             await self.stop()
-            asyncio.create_task(self.prewarm())
+            if not self.media:     # the video-mode process starts again with its next request
+                asyncio.create_task(self.prewarm())
 
     async def stop(self) -> None:
         if self.alive:
@@ -427,9 +598,21 @@ class Account:
     last_check_msg: str = ""
     verify_url: str = ""              # Google verification link from the last check, if any
     acp: AcpProcess | None = None
+    media: AcpProcess | None = None   # video mode: second, sandboxed process (created on the first request with a file)
 
     def usable(self) -> bool:
         return self.enabled and not self.disabled_reason and time.time() >= self.cooldown_until
+
+    def media_acp(self) -> AcpProcess:
+        if self.media is None:
+            self.media = AcpProcess(self, media=True)
+        return self.media
+
+    async def stop_processes(self) -> None:
+        """Stop both of the account's agy processes (restart after a new login or proxy, account deleted, shutdown)."""
+        for p in (self.acp, self.media):
+            if p:
+                await p.stop()
 
 
 EVENTS: deque = deque(maxlen=400)
@@ -520,9 +703,9 @@ class Pool:
         for name in [n for n in self.accounts if n not in seen]:
             acc = self.accounts.pop(name)
             event("info", name, "account removed")
-            if acc.acp and acc.acp.alive:
+            if any(p and p.alive for p in (acc.acp, acc.media)):
                 try:
-                    asyncio.get_running_loop().create_task(acc.acp.stop())
+                    asyncio.get_running_loop().create_task(acc.stop_processes())
                 except RuntimeError:
                     pass
 
@@ -594,109 +777,165 @@ POOL = Pool()
 
 
 async def run_on(acc: Account, model: str, effort: str | None, system: str, blocks: list[dict], deadline: float) -> AsyncIterator[tuple[str, str]]:
-    """One attempt on one account: new session -> model / thought level -> prompt -> stream (kind, text) -> close."""
-    acp = acc.acp
+    """One attempt on one account: new session -> model / thought level -> prompt -> stream (kind, text) -> close.
+    Blocks of type "media" (video mode) are written to a fresh request directory, sent as resource links to the
+    account's video-mode process, and deleted afterwards."""
+    has_media = any(b["type"] == "media" for b in blocks)
+    acp = acc.media_acp() if has_media else acc.acp
     assert acp is not None
     await acp.ensure()
-    params: dict[str, Any] = {"cwd": os.path.join(acc.home, "gw", "workspace"), "mcpServers": []}
-    if system:
-        params["_meta"] = {"antigravity": {"systemPrompt": {"append": system}}}
-    sess = await acp.request("session/new", params, 120)
-    acp.sessions += 1
-    sid = sess.get("sessionId")
-    if not sid:
-        raise AcpError("session/new returned no sessionId", "SERVER")
-    turn = Turn()
-    acp.turns[sid] = turn
+    req_dir, turn, sid = "", Turn(), None
     try:
-        opts = sess.get("configOptions") or []
-        mopt = next((o for o in opts if o.get("id") == "model" or o.get("category") == "model"), None)
-        offered = [str(o.get("value")) for o in (mopt or {}).get("options") or []]
-        if offered:
-            POOL.models_seen = offered
-        if offered and model not in offered and effort and f"{model}-{effort}" in offered:
-            model, effort = f"{model}-{effort}", None    # ids like "gpt-oss-120b-medium" carry the level in the name
-        if offered and model not in offered:
-            fm, fe = resolve_model(DEFAULT_MODEL)
-            if MODEL_FALLBACK and fm in offered:
-                log.info("model %s is not offered by Antigravity; using %s", model, DEFAULT_MODEL)
-                model, effort = fm, fe
-            else:
-                raise AcpError("this account has no model %s (available: %s)" % (model, ", ".join(offered)), "UNKNOWN_MODEL")
-        if not mopt or mopt.get("currentValue") != model:
-            res = await acp.request("session/set_config_option", {"sessionId": sid, "configId": (mopt or {}).get("id", "model"), "value": model}, 60)
-            opts = res.get("configOptions") or opts
-        lopt = next((o for o in opts if o.get("id") == "thought_level" or o.get("category") == "thought_level"), None)
-        levels = [str(o.get("value")) for o in (lopt or {}).get("options") or []]
-        if levels:
-            POOL.levels_seen = levels
-        if effort and lopt and lopt.get("currentValue") != effort and (not levels or effort in levels):
-            await acp.request("session/set_config_option", {"sessionId": sid, "configId": lopt.get("id", "thought_level"), "value": effort}, 60)
-        prompt = blocks
-        held: list[tuple[str, str]] = []   # hold the first ~400 chars so canned error replies can be recognised
-        held_len, released = 0, False
-        for i in range(MAX_CONTINUE + 1):
-            fut = asyncio.ensure_future(acp.request("session/prompt", {"sessionId": sid, "prompt": prompt}, max(5.0, deadline - time.time())))
-            while True:
-                getter = asyncio.ensure_future(turn.queue.get())
-                done, _ = await asyncio.wait({fut, getter}, timeout=max(0.1, deadline - time.time()), return_when=asyncio.FIRST_COMPLETED)
-                if getter in done:
-                    item = getter.result()
+        if has_media:
+            req_dir = os.path.join(media_home(acc.home), "w", secrets.token_hex(16))
+            os.mkdir(req_dir, 0o700)
+            blocks, allowed = await asyncio.to_thread(write_media, blocks, req_dir)
+            turn = Turn(allowed, req_dir)
+        params: dict[str, Any] = {"cwd": req_dir or acp.cwd, "mcpServers": []}
+        if system:
+            params["_meta"] = {"antigravity": {"systemPrompt": {"append": system}}}
+        sess = await acp.request("session/new", params, 120)
+        acp.sessions += 1
+        sid = sess.get("sessionId")
+        if not sid:
+            raise AcpError("session/new returned no sessionId", "SERVER")
+        acp.turns[sid] = turn
+        async for item in _run_session(acp, sess, turn, model, effort, blocks, deadline, has_media):
+            yield item
+    finally:
+        if sid:
+            acp.turns.pop(sid, None)
+            try:
+                await acp.request("session/close", {"sessionId": sid}, 15)
+            except Exception:  # noqa: BLE001
+                pass
+        if req_dir:
+            shutil.rmtree(req_dir, ignore_errors=True)
+            if sid:
+                forget_session(acc.home, sid)
+        await acp.maybe_recycle()
+
+
+def violation_error(path: str) -> AcpError:
+    """Video mode: the model tried to open something that is not a file of this request. Nothing it wrote after
+    that reaches the client; the request fails (400) and is not retried on another account."""
+    log.warning("video mode: stopped a request whose model tried to open %s", path[:200])
+    return AcpError("video mode: the request was stopped because the model tried to open a file that is not attached "
+                    "to it. Only the files sent with the request can be read.", "BLOCKED")
+
+
+def write_media(blocks: list[dict], req_dir: str) -> tuple[list[dict], set[str]]:
+    """Video mode: media blocks -> files attachment-N.<ext> in the request directory + resource_link blocks.
+    Returns (blocks to send, the only paths read_file may open)."""
+    out, allowed, n = [], set(), 0
+    for b in blocks:
+        if b["type"] != "media":
+            out.append(b)
+            continue
+        n += 1
+        name = "attachment-%d%s" % (n, MEDIA_EXT.get(b["mime"], ".bin"))
+        path = os.path.join(req_dir, name)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(b["data"])
+        allowed.update({os.path.normpath(path), os.path.realpath(path)})
+        out.append({"type": "resource_link", "uri": "file://" + path, "name": name, "mimeType": b["mime"]})
+    return out, allowed
+
+
+async def _run_session(acp: AcpProcess, sess: dict, turn: Turn, model: str, effort: str | None, blocks: list[dict],
+                       deadline: float, has_media: bool) -> AsyncIterator[tuple[str, str]]:
+    """model / thought level -> prompt -> stream (kind, text); auto-continues after max_tokens."""
+    sid = sess["sessionId"]
+    opts = sess.get("configOptions") or []
+    mopt = next((o for o in opts if o.get("id") == "model" or o.get("category") == "model"), None)
+    offered = [str(o.get("value")) for o in (mopt or {}).get("options") or []]
+    if offered:
+        POOL.models_seen = offered
+    if offered and model not in offered and effort and f"{model}-{effort}" in offered:
+        model, effort = f"{model}-{effort}", None    # ids like "gpt-oss-120b-medium" carry the level in the name
+    if offered and model not in offered:
+        fm, fe = resolve_model(DEFAULT_MODEL)
+        if MODEL_FALLBACK and fm in offered:
+            log.info("model %s is not offered by Antigravity; using %s", model, DEFAULT_MODEL)
+            model, effort = fm, fe
+        else:
+            raise AcpError("this account has no model %s (available: %s)" % (model, ", ".join(offered)), "UNKNOWN_MODEL")
+    if has_media and not VIDEO_MODELS.search(model):   # e.g. an unknown name that fell back to a non-Gemini default
+        raise AcpError("video mode: model %s cannot open video, audio or PDF files (AGY_VIDEO_MODELS)" % model, "BAD_REQUEST")
+    if not mopt or mopt.get("currentValue") != model:
+        res = await acp.request("session/set_config_option", {"sessionId": sid, "configId": (mopt or {}).get("id", "model"), "value": model}, 60)
+        opts = res.get("configOptions") or opts
+    lopt = next((o for o in opts if o.get("id") == "thought_level" or o.get("category") == "thought_level"), None)
+    levels = [str(o.get("value")) for o in (lopt or {}).get("options") or []]
+    if levels:
+        POOL.levels_seen = levels
+    if effort and lopt and lopt.get("currentValue") != effort and (not levels or effort in levels):
+        await acp.request("session/set_config_option", {"sessionId": sid, "configId": lopt.get("id", "thought_level"), "value": effort}, 60)
+    prompt = blocks
+    held: list[tuple[str, str]] = []   # hold the first ~400 chars so canned error replies can be recognised
+    held_len, released = 0, False
+    for i in range(MAX_CONTINUE + 1):
+        fut = asyncio.ensure_future(acp.request("session/prompt", {"sessionId": sid, "prompt": prompt}, max(5.0, deadline - time.time())))
+        while True:
+            getter = asyncio.ensure_future(turn.queue.get())
+            done, _ = await asyncio.wait({fut, getter}, timeout=max(0.1, deadline - time.time()), return_when=asyncio.FIRST_COMPLETED)
+            if getter in done:
+                item = getter.result()
+                if item[0] == "violation":
+                    await acp.notify("session/cancel", {"sessionId": sid})
+                    fut.cancel()
+                    raise violation_error(item[1])
+                if released or item[0] != "text":
+                    yield item
+                else:
+                    held.append(item)
+                    held_len += len(item[1])
+                    joined = "".join(t for _k, t in held)
+                    canned = could_be_canned(joined)
+                    err = soft_error(joined) if (held_len >= 400 or canned) else None
+                    if err:
+                        await acp.notify("session/cancel", {"sessionId": sid})
+                        fut.cancel()
+                        raise err
+                    if held_len >= 400 or not canned:
+                        for h in held:
+                            yield h
+                        held, released = [], True
+                continue
+            getter.cancel()
+            if fut in done:
+                while not turn.queue.empty():
+                    item = turn.queue.get_nowait()
+                    if item[0] == "violation":
+                        raise violation_error(item[1])
                     if released or item[0] != "text":
                         yield item
                     else:
                         held.append(item)
-                        held_len += len(item[1])
-                        joined = "".join(t for _k, t in held)
-                        canned = could_be_canned(joined)
-                        err = soft_error(joined) if (held_len >= 400 or canned) else None
-                        if err:
-                            await acp.notify("session/cancel", {"sessionId": sid})
-                            fut.cancel()
-                            raise err
-                        if held_len >= 400 or not canned:
-                            for h in held:
-                                yield h
-                            held, released = [], True
-                    continue
-                getter.cancel()
-                if fut in done:
-                    while not turn.queue.empty():
-                        item = turn.queue.get_nowait()
-                        if released or item[0] != "text":
-                            yield item
-                        else:
-                            held.append(item)
-                    break
-                if time.time() >= deadline:
-                    await acp.notify("session/cancel", {"sessionId": sid})
-                    fut.cancel()
-                    raise AcpError("generation timed out (%.0fs)" % REQUEST_TIMEOUT, "TIMEOUT")
-            result = fut.result()
-            if held and not released:
-                err = soft_error("".join(t for _k, t in held) + "\n")
-                if err:
-                    raise err
-                if result.get("stopReason") != "max_tokens":
-                    for h in held:
-                        yield h
-                    held, released = [], True
-            if isinstance(result.get("usage"), dict):
-                yield "usage", json.dumps(result["usage"])
-            stop = result.get("stopReason")
-            if stop == "max_tokens" and i < MAX_CONTINUE:
-                prompt = [{"type": "text", "text": "Continue exactly where you stopped. Do not repeat anything already written."}]
-                continue
-            if stop == "refusal":
-                raise AcpError("the model refused to answer", "BLOCKED")
-            break
-    finally:
-        acp.turns.pop(sid, None)
-        try:
-            await acp.request("session/close", {"sessionId": sid}, 15)
-        except Exception:  # noqa: BLE001
-            pass
-        await acp.maybe_recycle()
+                break
+            if time.time() >= deadline:
+                await acp.notify("session/cancel", {"sessionId": sid})
+                fut.cancel()
+                raise AcpError("generation timed out (%.0fs)" % REQUEST_TIMEOUT, "TIMEOUT")
+        result = fut.result()
+        if held and not released:
+            err = soft_error("".join(t for _k, t in held) + "\n")
+            if err:
+                raise err
+            if result.get("stopReason") != "max_tokens":
+                for h in held:
+                    yield h
+                held, released = [], True
+        if isinstance(result.get("usage"), dict):
+            yield "usage", json.dumps(result["usage"])
+        stop = result.get("stopReason")
+        if stop == "max_tokens" and i < MAX_CONTINUE:
+            prompt = [{"type": "text", "text": "Continue exactly where you stopped. Do not repeat anything already written."}]
+            continue
+        if stop == "refusal":
+            raise AcpError("the model refused to answer", "BLOCKED")
+        break
 
 
 async def generate(model_name: str, system: str, blocks: list[dict], effort_override: str | None = None) -> AsyncIterator[tuple[str, str, str]]:
@@ -774,37 +1013,148 @@ async def generate(model_name: str, system: str, blocks: list[dict], effort_over
 #   internal message: {"role": "user" | "assistant" | "tool", "parts": [...]}
 #   part: {"type": "text", "text"} | {"type": "image", "mime", "data"} | {"type": "image_url", "url"}
 #         | {"type": "tool_call", "id", "name", "arguments"} | {"type": "tool_result", "id", "name", "text", "is_error"}
+#         | {"type": "media", "mime", "data", "where"}   (video mode only: video / audio / PDF, base64 until prepare_media)
 # ======================================================================================================
+
+class BadContent(Exception):
+    """Content the gateway cannot hand to the model. Answered with HTTP 400 (in the format of the API that was called)
+    instead of being dropped: a model that silently misses a video or a PDF still answers, and makes the content up."""
+
+    def __init__(self, message: str, param: str = ""):
+        super().__init__(message)
+        self.param = param
+
+
+# Measured with agy 1.5.3 (ACP promptCapabilities: image yes, audio no, embeddedContext yes): image blocks must be
+# image/*; video, audio and PDF sent as embedded resources or audio blocks are accepted but never reach the model.
+MEDIA_HINT = ("ACP-Ant can pass only text and images to Antigravity; video, audio, PDF and other binary files cannot "
+              "reach the model through Antigravity's ACP interface. Send video as image frames, or use a provider that accepts files"
+              + ("" if VIDEO_MODE else " (or ask the gateway's owner about video mode, AGY_VIDEO_MODE=1, for Gemini models)"))
+
+
+def _media_part(mime: str, data: str, where: str) -> dict | None:
+    """Video mode: a video / audio / PDF payload the video-mode agent can open; None when not applicable."""
+    mime = (mime or "").strip().lower()
+    if VIDEO_MODE and mime in MEDIA_EXT:
+        return {"type": "media", "mime": mime, "data": data, "where": where}
+    return None
+
+
+def _url_media(url: str, where: str, what: str) -> list[dict]:
+    """Video mode: a video_url / audio_url style part. Only inline data: URIs; links are not downloaded."""
+    d = _parse_data_uri(url)
+    if d:
+        return _data_part(d[0], d[1], where, what)
+    if VIDEO_MODE and re.match(r"https?://", url or ""):
+        raise BadContent("unsupported content at %s: %s by link. Video mode does not download files: send it inline as a "
+                         "base64 data: URI" % (where, what), where)
+    raise _unsupported(where, what)
+
+
+def _unsupported(where: str, what: str) -> BadContent:
+    return BadContent("unsupported content at %s: %s. %s." % (where, what, MEDIA_HINT), where)
+
 
 def _text_part(t: Any) -> list[dict]:
     return [{"type": "text", "text": str(t)}] if t not in (None, "") else []
 
 
-def _image_from_url(url: str) -> dict:
-    mt = re.match(r"data:([\w/+.-]+);base64,(.*)$", url or "", re.S)
-    if mt:
-        return {"type": "image", "mime": mt.group(1), "data": mt.group(2)}
+_TEXT_MIMES = re.compile(r"^(text/[\w.+-]+|application/(json|xml|x-yaml|yaml|x-ndjson|csv))$", re.I)
+
+
+def _data_part(mime: str, data: str, where: str, what: str, name: str = "") -> list[dict]:
+    """Base64 payload with a MIME type: images go through, plain-text files become text, anything else is refused."""
+    mime = (mime or "").strip().lower()
+    if mime.startswith("image/"):
+        return [{"type": "image", "mime": mime, "data": data}]
+    media = _media_part(mime, data, where)
+    if media:
+        return [media]
+    if _TEXT_MIMES.match(mime):
+        try:
+            text = base64.b64decode(data, validate=False).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            raise _unsupported(where, "%s (%s) that is not valid base64 UTF-8 text" % (what, mime))
+        return _text_part("[file %s]\n%s" % (name, text) if name else text)
+    raise _unsupported(where, "%s (%s)" % (what, mime or "unknown type"))
+
+
+def _parse_data_uri(url: str) -> tuple[str, str] | None:
+    mt = re.match(r"data:([\w/+.-]*)(?:;[\w-]+=[^;,]*)*;base64,(.*)$", url or "", re.S)
+    return (mt.group(1), mt.group(2)) if mt else None
+
+
+def _image_from_url(url: str, where: str, what: str = "image") -> dict:
+    d = _parse_data_uri(url)
+    if d:
+        if not d[0].lower().startswith("image/"):
+            media = _media_part(d[0], d[1], where)
+            if media:
+                return media
+            raise _unsupported(where, "%s with a %s data URI" % (what, d[0] or "untyped"))
+        return {"type": "image", "mime": d[0].lower(), "data": d[1]}
     if re.match(r"https?://", url or ""):
-        return {"type": "image_url", "url": url}
-    return {"type": "text", "text": "[unreadable image reference]"}
+        return {"type": "image_url", "url": url, "where": where}
+    raise BadContent("%s at %s needs a base64 data: URI or an http(s) URL" % (what, where), where)
 
 
-def _openai_parts(content: Any) -> list[dict]:
+def _openai_file(p: dict, where: str) -> list[dict]:
+    """Chat Completions {"type": "file", "file": {"file_data", "filename"} | {"file_id"}}."""
+    f = p.get("file") if isinstance(p.get("file"), dict) else {}
+    name = str(f.get("filename") or "")
+    d = _parse_data_uri(str(f.get("file_data") or ""))
+    if d:
+        return _data_part(d[0], d[1], where, 'part "file"' + (" " + name if name else ""), name)
+    if f.get("file_id"):
+        raise BadContent('unsupported content at %s: part "file" by file_id (this gateway has no file storage). %s.' % (where, MEDIA_HINT), where)
+    raise _unsupported(where, 'part "file" without file_data')
+
+
+def _openai_parts(content: Any, where: str = "content") -> list[dict]:
     if content is None:
         return []
     if isinstance(content, str):
         return _text_part(content)
+    if not isinstance(content, list):
+        raise BadContent("%s must be a string or a list of content parts" % where, where)
     parts: list[dict] = []
-    for p in content if isinstance(content, list) else []:
+    for i, p in enumerate(content):
+        at = "%s[%d]" % (where, i)
         if not isinstance(p, dict):
-            continue
+            raise BadContent("%s must be an object" % at, at)
         t = p.get("type")
         if t in ("text", "input_text", "output_text"):
             parts += _text_part(p.get("text"))
+        elif t == "refusal":
+            parts += _text_part(p.get("refusal"))
         elif t in ("image_url", "input_image"):
             u = p.get("image_url")
-            parts.append(_image_from_url(str((u.get("url") if isinstance(u, dict) else u) or "")))
+            parts.append(_image_from_url(str((u.get("url") if isinstance(u, dict) else u) or ""), at, 'part "%s"' % t))
+        elif t == "file":
+            parts += _openai_file(p, at)
+        elif t == "input_audio" and VIDEO_MODE:
+            parts += _input_audio(p, at)
+        elif t in ("video_url", "audio_url") and VIDEO_MODE:
+            u = p.get(t)
+            parts += _url_media(str((u.get("url") if isinstance(u, dict) else u) or ""), at, 'part "%s"' % t)
+        else:   # input_audio, video_url, audio_url, ... : refuse rather than drop
+            raise _unsupported(at, 'part "%s"' % t)
     return parts
+
+
+def _input_audio(p: dict, where: str) -> list[dict]:
+    """OpenAI {"type": "input_audio", "input_audio": {"data": base64, "format": "wav" | "mp3" | ...}} (video mode)."""
+    a = p.get("input_audio") if isinstance(p.get("input_audio"), dict) else {}
+    fmt = str(a.get("format") or "").lower()
+    if fmt not in AUDIO_FORMATS or not a.get("data"):
+        raise _unsupported(where, 'part "input_audio" with format "%s"%s' % (fmt, "" if a.get("data") else " and no data"))
+    return _data_part(AUDIO_FORMATS[fmt], str(a["data"]), where, 'part "input_audio"')
+
+
+def _only_text(parts: list[dict], where: str) -> str:
+    if any(p["type"] != "text" for p in parts):
+        raise BadContent("%s can only contain text (put images in a user message)" % where, where)
+    return _joined_text(parts)
 
 
 def _joined_text(parts: list[dict]) -> str:
@@ -819,16 +1169,16 @@ def _args_str(a: Any) -> str:
 
 def from_openai(body: dict) -> tuple[str, list[dict], list[dict], Any]:
     system, msgs, names = [], [], {}
-    for m in body.get("messages") or []:
+    for n, m in enumerate(body.get("messages") or []):
         if not isinstance(m, dict):
             continue
-        role = m.get("role")
+        role, where = m.get("role"), "messages[%d].content" % n
         if role in ("system", "developer"):
-            system.append(_joined_text(_openai_parts(m.get("content"))))
+            system.append(_only_text(_openai_parts(m.get("content"), where), where))
         elif role == "user":
-            msgs.append({"role": "user", "parts": _openai_parts(m.get("content"))})
+            msgs.append({"role": "user", "parts": _openai_parts(m.get("content"), where)})
         elif role == "assistant":
-            parts = _openai_parts(m.get("content"))
+            parts = _openai_parts(m.get("content"), where)
             calls = list(m.get("tool_calls") or [])
             if m.get("function_call"):
                 calls.append({"id": "", "function": m["function_call"]})
@@ -839,7 +1189,7 @@ def from_openai(body: dict) -> tuple[str, list[dict], list[dict], Any]:
             msgs.append({"role": "assistant", "parts": parts})
         elif role in ("tool", "function"):
             tid = m.get("tool_call_id") or ""
-            content = _openai_parts(m.get("content"))
+            content = _openai_parts(m.get("content"), where)
             msgs.append({"role": "tool", "parts": [{"type": "tool_result", "id": tid, "name": m.get("name") or names.get(tid, ""),
                                                     "text": _joined_text(content), "is_error": False}]
                          + [p for p in content if p["type"] != "text"]})
@@ -860,47 +1210,78 @@ def from_openai(body: dict) -> tuple[str, list[dict], list[dict], Any]:
     return "\n\n".join(s for s in system if s), msgs, tools, choice
 
 
-def _anthropic_parts(content: Any) -> list[dict]:
+def _anthropic_skipped(t: str) -> bool:
+    """Blocks the model itself produced on another provider (reasoning, server-side tool calls and their results):
+    leaving them out loses nothing the user sent."""
+    return t in ("thinking", "redacted_thinking", "server_tool_use", "mcp_tool_use") or (t.endswith("_tool_result") and t != "tool_result")
+
+
+def _anthropic_parts(content: Any, where: str = "content") -> list[dict]:
+    if content is None:
+        return []
     if isinstance(content, str):
         return _text_part(content)
+    if not isinstance(content, list):
+        raise BadContent("%s must be a string or a list of content blocks" % where, where)
     parts: list[dict] = []
-    for b in content if isinstance(content, list) else []:
+    for i, b in enumerate(content):
+        at = "%s.%d" % (where, i)
         if not isinstance(b, dict):
-            continue
-        t = b.get("type")
+            raise BadContent("%s must be an object" % at, at)
+        t = str(b.get("type") or "")
+        src = b.get("source") if isinstance(b.get("source"), dict) else {}
+        st = src.get("type")
         if t == "text":
             parts += _text_part(b.get("text"))
         elif t == "image":
-            src = b.get("source") or {}
-            if src.get("type") == "base64":
-                parts.append({"type": "image", "mime": src.get("media_type") or "image/png", "data": src.get("data") or ""})
-            elif src.get("type") == "url":
-                parts.append(_image_from_url(str(src.get("url") or "")))
-        elif t == "document":
-            src = b.get("source") or {}
-            if src.get("type") == "text":
-                parts += _text_part(src.get("data"))
+            if st == "base64":
+                mime = str(src.get("media_type") or "image/png").lower()
+                if not mime.startswith("image/"):
+                    media = _media_part(mime, src.get("data") or "", at)
+                    if media:
+                        parts.append(media)
+                        continue
+                    raise _unsupported(at, "image block with media_type %s" % mime)
+                parts.append({"type": "image", "mime": mime, "data": src.get("data") or ""})
+            elif st == "url":
+                parts.append(_image_from_url(str(src.get("url") or ""), at, "image block"))
             else:
-                parts += _text_part("[document omitted: only plain-text documents are supported]")
+                raise _unsupported(at, 'image block with source type "%s"' % st)
+        elif t == "document":
+            title = str(b.get("title") or "")
+            if st == "text":
+                parts += _text_part("[document %s]\n%s" % (title, src.get("data") or "") if title else src.get("data"))
+            elif st == "content":   # a document given as a list of text / image blocks
+                parts += _anthropic_parts(src.get("content"), at + ".source.content")
+            elif st == "base64":
+                parts += _data_part(src.get("media_type") or "", src.get("data") or "", at, "document block", title)
+            else:   # url / file: PDFs, mostly
+                raise _unsupported(at, 'document block with source type "%s"' % st)
+        elif t == "search_result":
+            found = _only_text(_anthropic_parts(b.get("content"), at + ".content"), at + ".content")
+            parts += _text_part("[search result: %s (%s)]\n%s" % (b.get("title") or "", b.get("source") or "", found))
         elif t == "tool_use":
             parts.append({"type": "tool_call", "id": b.get("id") or "", "name": b.get("name") or "", "arguments": _args_str(b.get("input"))})
         elif t == "tool_result":
-            inner = _anthropic_parts(b.get("content"))
+            inner = _anthropic_parts(b.get("content"), at + ".content")
             parts.append({"type": "tool_result", "id": b.get("tool_use_id") or "", "name": "", "text": _joined_text(inner),
                           "is_error": bool(b.get("is_error"))})
             parts += [p for p in inner if p["type"] != "text"]
-        # thinking / redacted_thinking / server tool blocks are not forwarded
+        elif _anthropic_skipped(t):
+            continue
+        else:   # container_upload, audio, video, ... : refuse rather than drop
+            raise _unsupported(at, 'content block "%s"' % t)
     return parts
 
 
 def from_anthropic(body: dict) -> tuple[str, list[dict], list[dict], Any]:
     s = body.get("system")
-    system = s if isinstance(s, str) else _joined_text(_anthropic_parts(s))
+    system = s if isinstance(s, str) else _only_text(_anthropic_parts(s, "system"), "system")
     msgs, names = [], {}
-    for m in body.get("messages") or []:
+    for n, m in enumerate(body.get("messages") or []):
         if not isinstance(m, dict):
             continue
-        parts = _anthropic_parts(m.get("content"))
+        parts = _anthropic_parts(m.get("content"), "messages.%d.content" % n)
         if m.get("role") == "assistant":
             for p in parts:
                 if p["type"] == "tool_call":
@@ -927,22 +1308,40 @@ def from_anthropic(body: dict) -> tuple[str, list[dict], list[dict], Any]:
     return system, msgs, tools, choice
 
 
-def _responses_parts(content: Any) -> list[dict]:
+def _responses_parts(content: Any, where: str = "content") -> list[dict]:
+    if content is None:
+        return []
     if isinstance(content, str):
         return _text_part(content)
+    if not isinstance(content, list):
+        raise BadContent("%s must be a string or a list of content parts" % where, where)
     parts: list[dict] = []
-    for p in content if isinstance(content, list) else []:
+    for i, p in enumerate(content):
+        at = "%s[%d]" % (where, i)
         if not isinstance(p, dict):
-            continue
+            raise BadContent("%s must be an object" % at, at)
         t = p.get("type")
         if t in ("input_text", "output_text", "text", "summary_text"):
             parts += _text_part(p.get("text"))
         elif t == "input_image":
             u = p.get("image_url")
             u = u.get("url") if isinstance(u, dict) else u
-            parts.append(_image_from_url(str(u or "")) if u else {"type": "text", "text": "[image by file id not supported]"})
+            if not u:
+                raise BadContent('unsupported content at %s: part "input_image" by file_id (this gateway has no file storage); '
+                                 'send image_url as a data: URI or an http(s) URL' % at, at)
+            parts.append(_image_from_url(str(u), at, 'part "input_image"'))
+        elif t == "input_file":
+            name = str(p.get("filename") or "")
+            d = _parse_data_uri(str(p.get("file_data") or ""))
+            if not d:
+                raise _unsupported(at, 'part "input_file"%s by %s' % (" " + name if name else "", "file_id" if p.get("file_id") else "URL" if p.get("file_url") else "reference"))
+            parts += _data_part(d[0], d[1], at, 'part "input_file"' + (" " + name if name else ""), name)
         elif t == "refusal":
             parts += _text_part(p.get("refusal"))
+        elif t == "input_audio" and VIDEO_MODE:
+            parts += _input_audio(p, at)
+        else:   # input_audio, ... : refuse rather than drop
+            raise _unsupported(at, 'part "%s"' % t)
     return parts
 
 
@@ -961,14 +1360,15 @@ def from_responses(body: dict) -> tuple[str, list[dict], list[dict], Any, set[st
     items = body.get("input")
     if isinstance(items, str):
         items = [{"type": "message", "role": "user", "content": items}]
-    for it in items or []:
+    for n, it in enumerate(items or []):
         if not isinstance(it, dict):
             continue
         t = it.get("type") or ("message" if it.get("role") else "")
         if t == "message":
-            role, parts = it.get("role"), _responses_parts(it.get("content"))
+            where = "input[%d].content" % n
+            role, parts = it.get("role"), _responses_parts(it.get("content"), where)
             if role in ("system", "developer"):
-                system.append(_joined_text(parts))
+                system.append(_only_text(parts, where))
             else:
                 add("assistant" if role == "assistant" else "user", parts)
         elif t in ("function_call", "custom_tool_call"):
@@ -979,7 +1379,7 @@ def from_responses(body: dict) -> tuple[str, list[dict], list[dict], Any, set[st
         elif t in ("function_call_output", "custom_tool_call_output"):
             cid = it.get("call_id") or ""
             out = it.get("output")
-            parts = _text_part(out) if isinstance(out, str) else _responses_parts(out)
+            parts = _text_part(out) if isinstance(out, str) else _responses_parts(out, "input[%d].output" % n)
             add("tool", [{"type": "tool_result", "id": cid, "name": names.get(cid, ""), "text": _joined_text(parts), "is_error": False}]
                 + [p for p in parts if p["type"] != "text"])
         # reasoning items, web search calls etc. are not forwarded
@@ -1077,6 +1477,14 @@ def to_acp(system: str, msgs: list[dict], tools: list[dict], choice: Any, extra_
         else:
             blocks.append({"type": "image", "mimeType": p["mime"], "data": p["data"]})
 
+    n_media = 0
+
+    def media(p: dict) -> None:   # video mode: written to a file and sent as a link by run_on
+        nonlocal n_media
+        n_media += 1
+        text("[attachment %d: %s]" % (n_media, p["mime"]))
+        blocks.append({"type": "media", "mime": p["mime"], "data": p["data"]})
+
     def render(m: dict, labelled: bool) -> None:
         role = m["role"]
         if role == "tool":
@@ -1085,6 +1493,8 @@ def to_acp(system: str, msgs: list[dict], tools: list[dict], choice: Any, extra_
                     text('\n\n<tool_result name="%s"%s>\n%s\n</tool_result>' % (p["name"], ' is_error="true"' if p["is_error"] else "", p["text"]))
                 elif p["type"] == "image":
                     image(p)
+                elif p["type"] == "media":
+                    media(p)
             return
         if labelled:
             text("\n\n%s: " % ("User" if role == "user" else "Assistant"))
@@ -1095,6 +1505,8 @@ def to_acp(system: str, msgs: list[dict], tools: list[dict], choice: Any, extra_
                 text(p["text"])
             elif p["type"] == "image":
                 image(p)
+            elif p["type"] == "media":
+                media(p)
         calls = [p for p in m["parts"] if p["type"] == "tool_call"]
         if calls:
             text("\n" + _calls_block(calls))
@@ -1110,8 +1522,20 @@ def to_acp(system: str, msgs: list[dict], tools: list[dict], choice: Any, extra_
     if blocks and blocks[0]["type"] == "text":
         blocks[0]["text"] = blocks[0]["text"].lstrip("\n")
     if not any(b["type"] == "text" and b["text"].strip() for b in blocks):
-        blocks.append({"type": "text", "text": "(see the image)"})
+        blocks.append({"type": "text", "text": "(see the attachment)" if n_media else "(see the image)"})
     return "\n\n".join(s for s in sys_parts if s), blocks
+
+
+_IMAGE_MAGIC = ((b"\x89PNG\r\n\x1a\n", "image/png"), (b"\xff\xd8\xff", "image/jpeg"), (b"GIF87a", "image/gif"), (b"GIF89a", "image/gif"))
+
+
+def _sniff_image(data: bytes) -> str | None:
+    for magic, mime in _IMAGE_MAGIC:
+        if data.startswith(magic):
+            return mime
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 def _fetch_image(url: str) -> dict:
@@ -1120,22 +1544,56 @@ def _fetch_image(url: str) -> dict:
         data = r.read(20 * 1024 * 1024 + 1)
         if len(data) > 20 * 1024 * 1024:
             raise ValueError("image larger than 20 MB")
-        mime = (r.headers.get_content_type() or "image/jpeg")
-    return {"type": "image", "mime": mime if mime.startswith("image/") else "image/jpeg", "data": base64.b64encode(data).decode()}
+        ctype = (r.headers.get("Content-Type") and r.headers.get_content_type() or "").lower()
+    mime = ctype if ctype.startswith("image/") else _sniff_image(data)   # some storage servers say application/octet-stream
+    if not mime:
+        raise ValueError("the link is not an image (Content-Type %s)" % (ctype or "missing"))
+    return {"type": "image", "mime": mime, "data": base64.b64encode(data).decode()}
+
+
+def prepare_media(msgs: list[dict], model_name: str) -> None:
+    """Video mode: check the request's video / audio / PDF parts (Gemini model, count, size) and decode them.
+    Anything wrong is a 400 before an account is used."""
+    media = [p for m in msgs for p in m["parts"] if p["type"] == "media"]
+    if not media:
+        return
+    model, _level = resolve_model(model_name)
+    if not VIDEO_MODELS.search(model):
+        raise BadContent("unsupported content at %s: video mode passes video, audio and PDF only to Gemini models; model %s "
+                         "cannot open them. Use a Gemini model, for example gemini-4-argon" % (media[0]["where"], model), media[0]["where"])
+    if len(media) > VIDEO_MAX_FILES:
+        w = media[VIDEO_MAX_FILES]["where"]
+        raise BadContent("too many files at %s: video mode takes at most %d video / audio / PDF files per request "
+                         "(AGY_VIDEO_MAX_FILES)" % (w, VIDEO_MAX_FILES), w)
+    total = 0
+    for p in media:
+        if isinstance(p["data"], str):
+            try:
+                p["data"] = base64.b64decode(re.sub(r"\s+", "", p["data"]), validate=True)
+            except ValueError:
+                raise BadContent("the file at %s is not valid base64" % p["where"], p["where"])
+        if not p["data"]:
+            raise BadContent("the file at %s is empty" % p["where"], p["where"])
+        total += len(p["data"])
+        if total > VIDEO_MAX_MB * 1024 * 1024:
+            raise BadContent("files too large at %s: video mode takes at most %g MB of video / audio / PDF per request "
+                             "(AGY_VIDEO_MAX_MB)" % (p["where"], VIDEO_MAX_MB), p["where"])
 
 
 async def fetch_remote_images(msgs: list[dict]) -> None:
+    """Download http(s) image links. A link that cannot be used fails the request (400) instead of being left out."""
     for m in msgs:
         for i, p in enumerate(m["parts"]):
             if p["type"] != "image_url":
                 continue
+            where = p.get("where") or "content"
             if not FETCH_IMAGES:
-                m["parts"][i] = {"type": "text", "text": "[image link not fetched: %s]" % p["url"][:200]}
-                continue
+                raise BadContent("image link at %s: this gateway does not download image links (AGY_FETCH_IMAGES=0); "
+                                 "send the image as a base64 data: URI" % where, where)
             try:
                 m["parts"][i] = await asyncio.to_thread(_fetch_image, p["url"])
             except Exception as e:  # noqa: BLE001
-                m["parts"][i] = {"type": "text", "text": "[image could not be downloaded: %s]" % str(e)[:100]}
+                raise BadContent("image link at %s could not be used: %s" % (where, str(e)[:200]), where)
 
 
 # ======================================================================================================
@@ -1304,6 +1762,17 @@ def est_prompt(system: str, blocks: list[dict]) -> int:
 app = FastAPI(title="ACP-Ant", version=__version__, docs_url=None, redoc_url=None, openapi_url=None)
 
 
+@app.exception_handler(BadContent)
+async def _bad_content(request: Request, e: BadContent) -> JSONResponse:
+    """Content the model cannot receive: 400 in the error format of the API that was called (clients and fallback
+    logic recognise it), never a reply written without the content."""
+    log.info("400 unsupported content on %s: %s", request.url.path, str(e)[:200])
+    if request.url.path.startswith("/v1/messages"):
+        return JSONResponse({"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}}, status_code=400)
+    return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error", "param": e.param or None,
+                                   "code": "unsupported_content"}}, status_code=400)
+
+
 def check_key(request: Request) -> None:
     auth = request.headers.get("authorization", "")
     token = auth[7:] if auth[:7].lower() == "bearer " else (request.headers.get("x-api-key") or request.headers.get("api-key") or "")
@@ -1373,6 +1842,7 @@ async def chat_completions(request: Request):
     body = await _read_body(request)
     model_name = str(body.get("model") or DEFAULT_MODEL)
     system, msgs, tools, choice = from_openai(body)
+    prepare_media(msgs, model_name)
     await fetch_remote_images(msgs)
     system, blocks = to_acp(system, msgs, tools, choice, _json_instruction(body.get("response_format")), body.get("parallel_tool_calls") is not False)
     use_tools = bool(tools) and choice != "none"
@@ -1461,6 +1931,7 @@ async def messages(request: Request):
     body = await _read_body(request)
     model_name = str(body.get("model") or DEFAULT_MODEL)
     system, msgs, tools, choice = from_anthropic(body)
+    prepare_media(msgs, model_name)
     await fetch_remote_images(msgs)
     parallel = not (isinstance(body.get("tool_choice"), dict) and body["tool_choice"].get("disable_parallel_tool_use"))
     system, blocks = to_acp(system, msgs, tools, choice, parallel=parallel)
@@ -1570,6 +2041,7 @@ async def responses(request: Request):
     body = await _read_body(request)
     model_name = str(body.get("model") or DEFAULT_MODEL)
     system, msgs, tools, choice, custom = from_responses(body)
+    prepare_media(msgs, model_name)
     await fetch_remote_images(msgs)
     fmt = (body.get("text") or {}).get("format") or {}
     rf = {"type": "json_schema", "json_schema": {"schema": fmt.get("schema")}} if fmt.get("type") == "json_schema" else (
@@ -1710,7 +2182,8 @@ async def models(request: Request):
 @app.get("/healthz")
 async def healthz():
     POOL.scan()
-    return {"ok": True, "version": __version__, "accounts": len(POOL.accounts), "usable": sum(1 for a in POOL.accounts.values() if a.usable())}
+    return {"ok": True, "version": __version__, "accounts": len(POOL.accounts), "usable": sum(1 for a in POOL.accounts.values() if a.usable()),
+            "video_mode": VIDEO_MODE}
 
 
 async def read_quota(acc: Account, force: bool = False) -> Any:
@@ -1774,11 +2247,11 @@ async def status(request: Request, quota: int = 0):
         row = {"name": a.name, "usable": a.usable(), "inflight": a.inflight, "ok": a.ok, "fail": a.fail,
                "cooldown_s": max(0, int(a.cooldown_until - time.time())), "disabled": a.disabled_reason,
                "last_error": a.last_error, "last_error_ago_s": int(time.time() - a.last_error_at) if a.last_error_at else None,
-               "acp_alive": bool(a.acp and a.acp.alive)}
+               "acp_alive": bool(a.acp and a.acp.alive), "video_acp_alive": bool(a.media and a.media.alive)}
         if quota:
             row["quota"] = await read_quota(a)
         out.append(row)
-    return {"version": __version__, "accounts": out, "per_account": POOL.limit, "waiting": POOL.waiting}
+    return {"version": __version__, "accounts": out, "per_account": POOL.limit, "waiting": POOL.waiting, "video_mode": VIDEO_MODE}
 
 
 @app.post("/admin/reset/{name}")
@@ -1789,8 +2262,7 @@ async def reset(name: str, request: Request):
     if not a:
         raise HTTPException(404, "no such account")
     a.cooldown_until, a.disabled_reason = 0.0, ""
-    if a.acp:
-        await a.acp.stop()
+    await a.stop_processes()
     return {"ok": True}
 
 
@@ -1835,6 +2307,14 @@ async def _startup() -> None:
     if not shutil.which(AGY) and not os.path.exists(AGY):
         raise RuntimeError("agy not found: %s (set AGY_BIN)" % AGY)
     POOL.scan()
+    if VIDEO_MODE:
+        for a in POOL.accounts.values():
+            try:
+                clear_media_leftovers(a.home)
+            except OSError as e:
+                log.warning("video mode: could not clear %s: %s", media_home(a.home), e)
+        log.info("video mode on: video, audio and PDF go to %s through a separate read_file-only agy process per account",
+                 VIDEO_MODELS.pattern)
     if KEEP_HOURS > 0:
         asyncio.create_task(_janitor())
     asyncio.create_task(_stats_saver())
@@ -1858,8 +2338,7 @@ async def _stats_saver() -> None:
 async def _shutdown() -> None:
     STATS.save()
     for a in POOL.accounts.values():
-        if a.acp:
-            await a.acp.stop()
+        await a.stop_processes()
 
 
 # Web control panel (accounts, quota, switches, login, settings): served at "/", API under /panel/api
