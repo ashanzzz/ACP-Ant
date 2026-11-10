@@ -276,8 +276,20 @@ check("run_on: reading another path stops the request (BLOCKED)", err is not Non
 check("run_on: the error does not tell the client the server path", "proxy.env" not in str(err) and home not in str(err), err)
 check("run_on: nothing the model wrote after that reaches the client", not any("secret" in t for _k, t in out), out)
 check("run_on: the session was cancelled", "session/cancel" in acc.media.seen.get("notify", []), acc.media.seen.get("notify"))
-check("run_on: request dir deleted after a stopped request too", os.listdir(os.path.join(gw.media_home(home), "w")) == [],
-      os.listdir(os.path.join(gw.media_home(home), "w")))
+
+
+def list_request_dirs(path):
+    """media/w is mode 0o300 (write+search, not listable) on purpose; open it up only for the test's own check."""
+    mode = os.stat(path).st_mode & 0o777
+    os.chmod(path, 0o700)
+    try:
+        return os.listdir(path)
+    finally:
+        os.chmod(path, mode)
+
+
+W_DIR = os.path.join(gw.media_home(home), "w")
+check("run_on: request dir deleted after a stopped request too", list_request_dirs(W_DIR) == [], list_request_dirs(W_DIR))
 check("media HOME holds only the four fixed dirs", sorted(os.listdir(gw.media_home(home))) == ["empty", "tmp", "w"], os.listdir(gw.media_home(home)))
 
 # ---- HTTP: Gemini rule and limits answered with 400 before any account is used ---------------------------------------
