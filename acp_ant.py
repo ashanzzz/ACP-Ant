@@ -98,6 +98,8 @@ DEFAULT_MODEL = os.environ.get("AGY_DEFAULT_MODEL", "gemini-3.8-flash-medium")
 MODEL_FALLBACK = _env_bool("AGY_MODEL_FALLBACK", True)         # unknown model name -> DEFAULT_MODEL instead of an error
 MAX_IMAGES = _env_int("AGY_MAX_IMAGES", 10)                    # images per request (the most recent ones are kept)
 FETCH_IMAGES = _env_bool("AGY_FETCH_IMAGES", True)             # download http(s) image URLs sent by clients
+MAX_PROMPT_CHARS = _env_int("AGY_MAX_PROMPT_CHARS", 130000)        # prompt budget per turn; avoids agy's ~184KB tail truncation
+MAX_TOOL_RESULT_CHARS = _env_int("AGY_MAX_TOOL_RESULT_CHARS", 25000) # clamp individual oversized tool outputs
 # One long-lived `agy acp` per account serving all its sessions: session/new takes ~0.02 s instead of ~2 s with
 # --process-per-session (which starts a new worker for every request). Set 1 to go back to a process per session.
 PROCESS_PER_SESSION = _env_bool("AGY_PROCESS_PER_SESSION", False)
@@ -1448,6 +1450,36 @@ def _calls_block(calls: list[dict]) -> str:
     return "<tool_calls>\n" + json.dumps(arr, ensure_ascii=False) + "\n</tool_calls>"
 
 
+def _clamp_part(p: dict, max_chars: int) -> dict:
+    if p.get("type") == "tool_result":
+        t = p.get("text") or ""
+        if len(t) > max_chars:
+            half = max(500, (max_chars - 100) // 2)
+            clamped = f"{t[:half]}\n\n... [output truncated ({len(t)} chars) by gateway] ...\n\n{t[-half:]}"
+            return {**p, "text": clamped}
+    return p
+
+
+def _clamp_msg(m: dict, max_chars: int) -> dict:
+    parts = m.get("parts") or []
+    if any(p.get("type") == "tool_result" and len(p.get("text") or "") > max_chars for p in parts):
+        return {**m, "parts": [_clamp_part(p, max_chars) for p in parts]}
+    return m
+
+
+def _estimate_msg_chars(m: dict) -> int:
+    chars = 15
+    for p in m.get("parts") or []:
+        pt = p.get("type")
+        if pt == "text":
+            chars += len(p.get("text") or "")
+        elif pt == "tool_result":
+            chars += len(p.get("text") or "") + len(p.get("name") or "") + 40
+        elif pt == "tool_call":
+            chars += len(p.get("arguments") or "") + len(p.get("name") or "") + 40
+    return chars
+
+
 def to_acp(system: str, msgs: list[dict], tools: list[dict], choice: Any, extra_system: str = "", parallel: bool = True) -> tuple[str, list[dict]]:
     """Internal conversation -> (system prompt, ACP prompt blocks). Earlier turns become a transcript (images stay
     in place as image blocks); the trailing user / tool messages are this turn's input."""
@@ -1463,7 +1495,28 @@ def to_acp(system: str, msgs: list[dict], tools: list[dict], choice: Any, extra_
     while k > 0 and msgs[k - 1]["role"] != "assistant":
         k -= 1
     history, current = msgs[:k], msgs[k:]
-    n_img = sum(1 for m in msgs for p in m["parts"] if p["type"] == "image")
+
+    # Protect current turn from being eclipsed: clamp oversized tool outputs and calculate budget
+    current = [_clamp_msg(m, MAX_TOOL_RESULT_CHARS) for m in current]
+    current_est = sum(_estimate_msg_chars(m) for m in current)
+    history_budget = max(0, MAX_PROMPT_CHARS - current_est - 500)
+
+    # Prune history from newest to oldest if total exceeds budget
+    history_kept = []
+    consumed = 0
+    history_omitted = False
+
+    for m in reversed(history):
+        m_clamped = _clamp_msg(m, MAX_TOOL_RESULT_CHARS)
+        m_chars = _estimate_msg_chars(m_clamped)
+        if consumed + m_chars <= history_budget:
+            history_kept.append(m_clamped)
+            consumed += m_chars
+        else:
+            history_omitted = True
+
+    history = list(reversed(history_kept))
+    n_img = sum(1 for m in (history + current) for p in m["parts"] if p["type"] == "image")
     skip = max(0, n_img - MAX_IMAGES)       # drop the oldest images beyond the limit
     blocks: list[dict] = []
 
@@ -1517,6 +1570,8 @@ def to_acp(system: str, msgs: list[dict], tools: list[dict], choice: Any, extra_
 
     if history:
         text("<conversation_history>")
+        if history_omitted:
+            text("\n[... earlier conversation history omitted to stay within token budget ...]\n")
         for m in history:
             render(m, True)
         text("\n</conversation_history>\n\n" + ("The latest input for this turn:\n" if current else
